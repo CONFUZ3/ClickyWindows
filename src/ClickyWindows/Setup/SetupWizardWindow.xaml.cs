@@ -22,38 +22,29 @@ public partial class SetupWizardWindow : Window
 
     private void OnLoaded(object sender, RoutedEventArgs e)
     {
-        AnthropicKeyBox.Password  = CredentialStore.GetKey(CredentialStore.AnthropicTarget)  ?? "";
-        ElevenLabsKeyBox.Password = CredentialStore.GetKey(CredentialStore.ElevenLabsTarget) ?? "";
-        AssemblyAIKeyBox.Password = CredentialStore.GetKey(CredentialStore.AssemblyAITarget) ?? "";
+        GeminiKeyBox.Password = CredentialStore.GetKey(CredentialStore.GeminiTarget) ?? "";
     }
 
     private void OnSave(object sender, RoutedEventArgs e)
     {
-        var anthropic  = AnthropicKeyBox.Password.Trim();
-        var elevenLabs = ElevenLabsKeyBox.Password.Trim();
-        var assemblyAI = AssemblyAIKeyBox.Password.Trim();
+        var geminiKey = GeminiKeyBox.Password.Trim();
 
-        if (string.IsNullOrEmpty(anthropic) ||
-            string.IsNullOrEmpty(elevenLabs) ||
-            string.IsNullOrEmpty(assemblyAI))
+        if (string.IsNullOrEmpty(geminiKey))
         {
-            ErrorText.Text = "All three API keys are required.";
+            ErrorText.Text = "Gemini API key is required.";
             ErrorText.Visibility = Visibility.Visible;
             return;
         }
 
         try
         {
-            CredentialStore.SaveKey(CredentialStore.AnthropicTarget,  anthropic);
-            CredentialStore.SaveKey(CredentialStore.ElevenLabsTarget, elevenLabs);
-            CredentialStore.SaveKey(CredentialStore.AssemblyAITarget, assemblyAI);
-
+            CredentialStore.SaveKey(CredentialStore.GeminiTarget, geminiKey);
             DialogResult = true;
             Close();
         }
         catch (Exception ex)
         {
-            ErrorText.Text = $"Failed to save keys: {ex.Message}";
+            ErrorText.Text = $"Failed to save key: {ex.Message}";
             ErrorText.Visibility = Visibility.Visible;
         }
     }

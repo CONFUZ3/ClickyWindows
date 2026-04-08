@@ -31,39 +31,19 @@
         <TextBlock Text="Welcome to Clicky for Windows"
                    FontSize="18" FontWeight="Bold" Margin="0,0,0,6"/>
         <TextBlock TextWrapping="Wrap" Margin="0,0,0,20" Foreground="#555">
-            Enter your three API keys below. They are stored securely in Windows
+            Enter your Gemini API key below. It is stored securely in Windows
             Credential Manager — never saved to any file.
         </TextBlock>
 
-        <!-- Anthropic -->
-        <TextBlock Style="{StaticResource Label}" Text="Anthropic API Key"/>
+        <!-- Gemini -->
+        <TextBlock Style="{StaticResource Label}" Text="Gemini API Key"/>
         <TextBlock Style="{StaticResource Link}">
-            <Hyperlink NavigateUri="https://console.anthropic.com/settings/keys"
+            <Hyperlink NavigateUri="https://aistudio.google.com/app/apikey"
                        RequestNavigate="OnLinkNavigate">
-                Get your key at console.anthropic.com →
+                Get your key at aistudio.google.com →
             </Hyperlink>
         </TextBlock>
-        <PasswordBox x:Name="AnthropicKeyBox"/>
-
-        <!-- ElevenLabs -->
-        <TextBlock Style="{StaticResource Label}" Text="ElevenLabs API Key"/>
-        <TextBlock Style="{StaticResource Link}">
-            <Hyperlink NavigateUri="https://elevenlabs.io/app/settings/api-keys"
-                       RequestNavigate="OnLinkNavigate">
-                Get your key at elevenlabs.io →
-            </Hyperlink>
-        </TextBlock>
-        <PasswordBox x:Name="ElevenLabsKeyBox"/>
-
-        <!-- AssemblyAI -->
-        <TextBlock Style="{StaticResource Label}" Text="AssemblyAI API Key"/>
-        <TextBlock Style="{StaticResource Link}">
-            <Hyperlink NavigateUri="https://www.assemblyai.com/dashboard"
-                       RequestNavigate="OnLinkNavigate">
-                Get your key at assemblyai.com →
-            </Hyperlink>
-        </TextBlock>
-        <PasswordBox x:Name="AssemblyAIKeyBox"/>
+        <PasswordBox x:Name="GeminiKeyBox"/>
 
         <!-- Error -->
         <TextBlock x:Name="ErrorText"

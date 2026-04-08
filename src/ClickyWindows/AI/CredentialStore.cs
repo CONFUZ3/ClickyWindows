@@ -10,9 +10,7 @@ namespace ClickyWindows.AI;
 /// </summary>
 public static class CredentialStore
 {
-    public const string AnthropicTarget  = "ClickyWindows/AnthropicApiKey";
-    public const string ElevenLabsTarget = "ClickyWindows/ElevenLabsApiKey";
-    public const string AssemblyAITarget = "ClickyWindows/AssemblyAIApiKey";
+    public const string GeminiTarget = "ClickyWindows/GeminiApiKey";
 
     /// <summary>Returns the stored secret for <paramref name="target"/>, or null if not found.</summary>
     public static string? GetKey(string target)
@@ -64,21 +62,15 @@ public static class CredentialStore
         }
     }
 
-    /// <summary>Returns true only if all three API keys are present in Credential Manager.</summary>
+    /// <summary>Returns true only if the Gemini API key is present in Credential Manager.</summary>
     public static bool HasAllKeys() =>
-        GetKey(AnthropicTarget)  != null &&
-        GetKey(ElevenLabsTarget) != null &&
-        GetKey(AssemblyAITarget) != null;
+        GetKey(GeminiTarget) != null;
 
     public static IReadOnlyList<string> GetMissingKeyNames()
     {
         var missing = new List<string>();
-        if (string.IsNullOrWhiteSpace(GetKey(AnthropicTarget)))
-            missing.Add("Anthropic");
-        if (string.IsNullOrWhiteSpace(GetKey(ElevenLabsTarget)))
-            missing.Add("ElevenLabs");
-        if (string.IsNullOrWhiteSpace(GetKey(AssemblyAITarget)))
-            missing.Add("AssemblyAI");
+        if (string.IsNullOrWhiteSpace(GetKey(GeminiTarget)))
+            missing.Add("Gemini");
         return missing;
     }
 }
