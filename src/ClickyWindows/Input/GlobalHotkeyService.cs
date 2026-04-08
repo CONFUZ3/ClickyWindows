@@ -8,7 +8,8 @@ namespace ClickyWindows.Input;
 /// <summary>
 /// WH_KEYBOARD_LL hook with minimal callback (set flag + return) and health check.
 /// Default hotkey: Ctrl+Alt (press = start, release = stop).
-/// Per plan: callback has 300ms OS timeout; silently removed after ~10 violations.
+/// Monitors hook health and auto-recovers if Windows silently removes it.
+/// The hook MUST be registered on a thread with a message pump (the WPF UI thread).
 /// </summary>
 public class GlobalHotkeyService
 {
@@ -19,11 +20,15 @@ public class GlobalHotkeyService
     // Minimal callback flag
     private volatile bool _altDown;
     private volatile bool _ctrlDown;
-    private DateTime _lastCallbackTime = DateTime.UtcNow;
-
     private Thread? _processingThread;
     private CancellationTokenSource? _cts;
-    private readonly System.Threading.Timer _healthTimer;
+
+    // Hook health monitoring — only activates after first callback proves the hook worked
+    private volatile bool _everReceivedCallback;
+    private long _lastCallbackTicks;
+    private int _reRegisterCount;
+    private const int HealthCheckIntervalIterations = 500; // 500 * 10ms = 5s
+    private static readonly long StaleThresholdTicks = Stopwatch.Frequency * 30; // 30 seconds
 
     public event Action? HotkeyPressed;
     public event Action? HotkeyReleased;
@@ -31,14 +36,13 @@ public class GlobalHotkeyService
     public GlobalHotkeyService(AppSettings settings)
     {
         _settings = settings;
-        _healthTimer = new System.Threading.Timer(OnHealthCheck, null, Timeout.Infinite, Timeout.Infinite);
     }
 
+    /// <summary>Must be called from the UI thread.</summary>
     public void Start()
     {
         _cts = new CancellationTokenSource();
         RegisterHook();
-        _healthTimer.Change(TimeSpan.FromSeconds(5), TimeSpan.FromSeconds(5));
 
         _processingThread = new Thread(ProcessingLoop)
         {
@@ -50,13 +54,15 @@ public class GlobalHotkeyService
 
     public void Stop()
     {
-        _healthTimer.Change(Timeout.Infinite, Timeout.Infinite);
         _cts?.Cancel();
         UnregisterHook();
     }
 
+    /// <summary>Must be called from the UI thread (message pump required for WH_KEYBOARD_LL).</summary>
     private void RegisterHook()
     {
+        UnregisterHook(); // clean up any previous hook
+
         // Keep a GC-rooted reference to the delegate
         _hookProc = LowLevelKeyboardProc;
         using var process = Process.GetCurrentProcess();
@@ -70,7 +76,7 @@ public class GlobalHotkeyService
         if (_hookHandle == IntPtr.Zero)
             Log.Error("Failed to register keyboard hook (error: {Error})", Marshal.GetLastWin32Error());
         else
-            Log.Information("Keyboard hook registered");
+            Log.Information("Keyboard hook registered (attempt #{Count})", _reRegisterCount + 1);
     }
 
     private void UnregisterHook()
@@ -89,10 +95,12 @@ public class GlobalHotkeyService
     /// </summary>
     private IntPtr LowLevelKeyboardProc(int nCode, IntPtr wParam, IntPtr lParam)
     {
+        // Update heartbeat — must be first, before any other work
+        _everReceivedCallback = true;
+        Interlocked.Exchange(ref _lastCallbackTicks, Stopwatch.GetTimestamp());
+
         if (nCode >= 0)
         {
-            _lastCallbackTime = DateTime.UtcNow;
-
             var msg = wParam.ToInt32();
             var kb = Marshal.PtrToStructure<NativeMethods.KBDLLHOOKSTRUCT>(lParam);
 
@@ -117,6 +125,8 @@ public class GlobalHotkeyService
     private void ProcessingLoop()
     {
         bool wasActive = false;
+        int iteration = 0;
+
         while (_cts?.IsCancellationRequested == false)
         {
             bool isActive = _ctrlDown && _altDown;
@@ -134,24 +144,36 @@ public class GlobalHotkeyService
                 Log.Debug("Hotkey released (Ctrl+Alt)");
             }
 
+            // Periodic hook health check — only after we've confirmed the hook worked at least once
+            iteration++;
+            if (iteration % HealthCheckIntervalIterations == 0 && _everReceivedCallback)
+            {
+                CheckHookHealth();
+            }
+
             Thread.Sleep(10); // 10ms polling is fine for key state
         }
     }
 
-    private void OnHealthCheck(object? state)
+    private void CheckHookHealth()
     {
-        // If no callbacks received for 5s, the hook was silently removed — re-register.
-        // MUST dispatch to UI thread: WH_KEYBOARD_LL requires a message pump on the
-        // registering thread. Thread pool threads have no message pump, so hooks
-        // registered there never deliver callbacks and immediately die.
-        if ((DateTime.UtcNow - _lastCallbackTime).TotalSeconds > 5)
+        var lastTicks = Interlocked.Read(ref _lastCallbackTicks);
+        var elapsed = Stopwatch.GetTimestamp() - lastTicks;
+
+        if (elapsed > StaleThresholdTicks)
         {
-            Log.Warning("Keyboard hook appears dead (no callbacks for 5s) — re-registering");
-            System.Windows.Application.Current?.Dispatcher.Invoke(() =>
-            {
-                UnregisterHook();
-                RegisterHook();
-            });
+            _reRegisterCount++;
+            Log.Warning(
+                "Keyboard hook appears dead (no callbacks for {Sec:F1}s). Re-registering on UI thread... (attempt #{Count})",
+                (double)elapsed / Stopwatch.Frequency,
+                _reRegisterCount + 1);
+
+            // Reset key state to avoid phantom keys
+            _altDown = false;
+            _ctrlDown = false;
+
+            // WH_KEYBOARD_LL requires a message pump — must re-register on the UI thread
+            System.Windows.Application.Current?.Dispatcher.BeginInvoke(RegisterHook);
         }
     }
 }

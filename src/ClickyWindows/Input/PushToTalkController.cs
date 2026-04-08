@@ -19,6 +19,7 @@ public class PushToTalkController : IDisposable
     private readonly MicrophoneRecorder _recorder;
     private readonly ScreenCaptureService _screenCapture;
     private readonly string? _geminiApiKey;
+    private readonly Queue<byte[]> _audioBuffer = new();
 
     private CancellationTokenSource? _interactionCts;
 
@@ -37,7 +38,7 @@ public class PushToTalkController : IDisposable
 
         _recorder.LevelsUpdated += levels =>
         {
-            System.Windows.Application.Current?.Dispatcher.Invoke(() =>
+            System.Windows.Application.Current?.Dispatcher.BeginInvoke(() =>
                 _overlay.SetWaveformLevels(levels));
         };
 
@@ -48,12 +49,12 @@ public class PushToTalkController : IDisposable
     {
         lock (_stateLock)
         {
-            if (_state == AppState.Speaking)
+            if (_state == AppState.Speaking || _state == AppState.Processing)
             {
                 CancelCurrentTurnLocked();
             }
 
-            if (_state == AppState.Idle || _state == AppState.Speaking)
+            if (_state == AppState.Idle || _state == AppState.Speaking || _state == AppState.Processing)
             {
                 _ = StartRecordingAsync();
             }
@@ -87,7 +88,7 @@ public class PushToTalkController : IDisposable
         _interactionCts?.Dispose();
         _interactionCts = new CancellationTokenSource();
 
-        System.Windows.Application.Current?.Dispatcher.Invoke(() =>
+        System.Windows.Application.Current?.Dispatcher.BeginInvoke(() =>
             _overlay.SetState(AppState.Recording));
 
         try
@@ -102,7 +103,20 @@ public class PushToTalkController : IDisposable
                 _gemini.ErrorOccurred += OnGeminiError;
             }
 
+            // Initialize playback and start recording immediately to avoid missing audio
+            _playback.Initialize(new NAudio.Wave.WaveFormat(24000, 16, 1));
+            lock (_audioBuffer) { _audioBuffer.Clear(); }
+            
+            _recorder.DataAvailable -= OnAudioData; // prevent double-subscription
+            _recorder.DataAvailable += OnAudioData;
+            _recorder.StartRecording();
+
             await _gemini.ConnectAsync(_interactionCts.Token);
+
+            lock (_stateLock)
+            {
+                if (_state != AppState.Recording) return;
+            }
 
             var monitors = _overlay.GetMonitors();
             var captures = _screenCapture.CaptureAll(monitors);
@@ -110,12 +124,8 @@ public class PushToTalkController : IDisposable
             {
                 await _gemini.SendScreenshotAsync(captures.First().Base64Jpeg, _interactionCts.Token);
             }
-
-            // Gemini audio output is typically 24kHz 16-bit mono
-            _playback.Initialize(new NAudio.Wave.WaveFormat(24000, 16, 1));
             
-            _recorder.DataAvailable += OnAudioData;
-            _recorder.StartRecording();
+            // Note: OnAudioData is running concurrently and will flush the buffer now that we are connected.
         }
         catch (Exception ex)
         {
@@ -132,7 +142,38 @@ public class PushToTalkController : IDisposable
             {
                 var copy = new byte[count];
                 Buffer.BlockCopy(buffer, 0, copy, 0, count);
-                await _gemini.SendAudioAsync(copy, _interactionCts?.Token ?? CancellationToken.None);
+
+                if (!_gemini.IsConnected)
+                {
+                    lock (_audioBuffer)
+                    {
+                        _audioBuffer.Enqueue(copy);
+                    }
+                }
+                else
+                {
+                    // Flush buffered audio first
+                    while (true)
+                    {
+                        byte[]? queued = null;
+                        lock (_audioBuffer)
+                        {
+                            if (_audioBuffer.Count > 0)
+                                queued = _audioBuffer.Dequeue();
+                        }
+                        
+                        if (queued != null)
+                        {
+                            await _gemini.SendAudioAsync(queued, _interactionCts?.Token ?? CancellationToken.None);
+                        }
+                        else
+                        {
+                            break;
+                        }
+                    }
+
+                    await _gemini.SendAudioAsync(copy, _interactionCts?.Token ?? CancellationToken.None);
+                }
             }
         }
         catch (Exception ex)
@@ -146,7 +187,7 @@ public class PushToTalkController : IDisposable
         lock (_stateLock)
         {
             _state = AppState.Processing;
-            System.Windows.Application.Current?.Dispatcher.Invoke(() =>
+            System.Windows.Application.Current?.Dispatcher.BeginInvoke(() =>
                 _overlay.SetState(AppState.Processing));
         }
 
@@ -176,7 +217,7 @@ public class PushToTalkController : IDisposable
                 if (_state == AppState.Processing)
                 {
                     _state = AppState.Speaking;
-                    System.Windows.Application.Current?.Dispatcher.Invoke(() =>
+                    System.Windows.Application.Current?.Dispatcher.BeginInvoke(() =>
                         _overlay.SetState(AppState.Speaking));
                 }
             }
@@ -207,7 +248,7 @@ public class PushToTalkController : IDisposable
             var monitor = monitors.Count > pt.ScreenIndex ? monitors[pt.ScreenIndex] : monitors[0];
             var phrase = NavigationPhrases[Random.Shared.Next(NavigationPhrases.Length)];
 
-            System.Windows.Application.Current?.Dispatcher.Invoke(() =>
+            System.Windows.Application.Current?.Dispatcher.BeginInvoke(() =>
             {
                 _overlay.SetSpeechBubble(phrase);
                 _overlay.StartFlightTo(
@@ -250,7 +291,7 @@ public class PushToTalkController : IDisposable
         _recorder.StopRecording();
         _interactionCts?.Cancel();
 
-        System.Windows.Application.Current?.Dispatcher.Invoke(() =>
+        System.Windows.Application.Current?.Dispatcher.BeginInvoke(() =>
         {
             _overlay.SetState(AppState.Idle);
             _overlay.SetSpeechBubble("");
