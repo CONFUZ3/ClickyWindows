@@ -1,109 +1,148 @@
 # ClickyWindows
 
-A Windows port of [Clicky](https://github.com/farzaa/clicky) — an AI voice companion that lives as a blue triangle overlay on your screen. Hold a hotkey, speak, and it responds with voice while animating its triangle cursor to locations it references on your screen.
+A Windows port of [Clicky](https://github.com/farzaa/clicky) — an AI voice companion that lives as a blue triangle overlay on your screen. Hold a hotkey, speak, and it responds with voice while flying its triangle cursor to locations it references on your display.
 
-**Powered by:** Claude (Anthropic) · ElevenLabs TTS · AssemblyAI real-time transcription
+Powered entirely by the **Gemini Live API** — one WebSocket handles speech recognition, AI reasoning, and text-to-speech. No separate transcription or TTS service needed.
+
+---
+
+## Demo
+
+> *Hold Ctrl+Alt, ask "what's in the top-right corner?", release — the triangle flies there as Gemini responds.*
 
 ---
 
 ## Features
 
-- **Push-to-talk voice input** — hold Ctrl+Alt to record, release to process
-- **Full-screen overlay** — transparent triangle cursor visible across all monitors
-- **Animated pointer** — Claude can reference screen locations with `[POINT:x,y]` and the triangle flies there via Bezier arc
-- **Real-time transcription** — AssemblyAI v3 WebSocket streams audio as you speak
-- **Voice responses** — ElevenLabs TTS speaks Claude's reply
-- **Conversation history** — multi-turn context across interactions
-- **System tray app** — runs quietly in the background
+- **Push-to-talk** — hold Ctrl+Alt to record, release to send
+- **Full-screen transparent overlay** — the blue triangle stays on top across all monitors
+- **Animated pointer** — Gemini references screen locations with `[POINT:x,y:label:screen0]` tags; the triangle flies there via a Bezier arc
+- **Unified AI pipeline** — speech-to-text, reasoning, and voice output in a single Gemini Live WebSocket session
+- **Conversation history** — multi-turn context is carried across interactions
+- **Interrupt** — press the hotkey mid-response to cancel TTS and start a new recording immediately
+- **System tray app** — no taskbar icon, no main window; lives quietly in the background
 
 ---
 
 ## Prerequisites
 
-You need API keys for three services:
-
-| Service | Purpose | Free tier? |
-|---------|---------|------------|
-| [Anthropic](https://console.anthropic.com/settings/keys) | Claude AI responses | Pay-per-use |
-| [ElevenLabs](https://elevenlabs.io/app/settings/api-keys) | Text-to-speech voice | Yes (limited) |
-| [AssemblyAI](https://www.assemblyai.com/dashboard) | Real-time transcription | Pay-per-use |
-
-No Node.js, no proxy server, no environment variables needed.
+- Windows 10/11 (x64)
+- A **Gemini API key** — get one free at [aistudio.google.com](https://aistudio.google.com/apikey)
+- No Node.js, no proxy server, no environment variables
 
 ---
 
-## Setup
+## Installation
 
-1. Download `ClickyWindows.zip` from the [Releases](../../releases) page, extract, and run `ClickyWindows.exe`
-2. A setup wizard appears on first launch — enter your three API keys
-3. Click **Save and Start**
+### Option A — Download a release
 
-Keys are stored in **Windows Credential Manager** (not in any file). To update keys later: right-click the tray icon → **Manage API Keys...**
+1. Download `ClickyWindows-vX.X.X-win-x64.zip` from the [Releases](../../releases) page
+2. Extract the zip anywhere
+3. Run `ClickyWindows.exe`
+
+### Option B — Build from source
+
+Requires the [.NET 8 SDK](https://dotnet.microsoft.com/download/dotnet/8.0).
+
+```bash
+# Clone
+git clone https://github.com/your-username/clickywindows.git
+cd clickywindows
+
+# Run directly
+dotnet run --project src/ClickyWindows
+
+# Or build a self-contained release (no SDK needed to run)
+dotnet publish src/ClickyWindows/ClickyWindows.csproj \
+  --configuration Release \
+  --runtime win-x64 \
+  --self-contained true \
+  --output dist/
+```
+
+---
+
+## First-run setup
+
+On first launch a setup wizard appears. Paste your Gemini API key and click **Save and Start**.
+
+Your key is stored in **Windows Credential Manager** — never written to any file on disk. To update it later, right-click the tray icon → **Manage API Keys...**
 
 ---
 
 ## Usage
 
-1. Launch `ClickyWindows.exe` — a tray icon appears
-2. Hold **Ctrl+Alt** and speak your request
-3. Release to stop recording — the app transcribes, sends to Claude, and speaks the response
-4. The blue triangle animates to any screen location Claude references
+| Action | How |
+|--------|-----|
+| Ask a question | Hold **Ctrl+Alt**, speak, release |
+| Interrupt a response | Hold **Ctrl+Alt** while Gemini is still talking |
+| Quit | Right-click tray icon → **Quit** |
 
-**Interrupt:** Hold Ctrl+Alt during a response to stop TTS and start a new recording.
-
-**Exit:** Right-click the tray icon → Quit.
+The triangle animates to whatever screen element Gemini references in its reply.
 
 ---
 
 ## Configuration
 
-`src/ClickyWindows/appsettings.json` (optional overrides):
+`appsettings.json` (sits next to the `.exe`) lets you tweak defaults without recompiling:
 
-| Key | Default | Description |
-|-----|---------|-------------|
-| `Hotkey.Key` | `Menu` | Push-to-talk key (Menu = Alt) |
-| `Hotkey.Modifiers` | `Control` | Modifier key |
-| `AssemblyAI.SpeechModel` | `u3-rt-pro` | AssemblyAI model |
-| `Claude.Model` | `claude-sonnet-4-6` | Anthropic model ID |
-| `Claude.MaxHistory` | `10` | Conversation turns to retain |
-| `ElevenLabs.VoiceId` | `21m00Tcm4TlvDq8ikWAM` | ElevenLabs voice (Rachel) |
+```json
+{
+  "Hotkey": {
+    "Key": "Menu",
+    "Modifiers": "Control"
+  },
+  "Audio": {
+    "SampleRate": 16000,
+    "PreBufferMs": 250,
+    "PlaybackBufferSeconds": 45
+  },
+  "Gemini": {
+    "Model": "models/gemini-3.1-flash-live-preview",
+    "VoiceName": "Aoede",
+    "ConnectTimeoutMs": 5000
+  }
+}
+```
+
+`Key: "Menu"` is the right Alt key. `Modifiers: "Control"` means the left Ctrl must be held simultaneously. Available voice names (as of Gemini 2.5): `Aoede`, `Charon`, `Fenrir`, `Kore`, `Puck`.
 
 ---
 
 ## Architecture
 
 ```
-Hotkey press → MicrophoneRecorder → PCM stream → AssemblyAI v3 WebSocket (direct)
-                                                        ↓ transcript
-ScreenCaptureService → ClaudeService (SSE, direct) ← ConversationHistory
-                              ↓ streamed text
-                        PointParser → FlightPathAnimator (Bezier arc overlay)
-                              ↓ full text
-                        TtsService → AudioPlaybackService (WasapiOut)
+Hotkey press ─┬─ MicrophoneRecorder (16kHz PCM) ──────────► GeminiLiveService.SendAudioAsync
+              │                                                        │
+              └─ ScreenCaptureService (JPEG) ──► SendScreenshotAsync  │
+                                                                       │
+                                             Gemini Live WebSocket (bidi)
+                                                                       │
+              ┌────────────────────────────────────────────────────────┤
+              ▼                                 ▼                      ▼
+  inputTranscription (user words)   modelTurn.inlineData (PCM 24kHz)  outputTranscription
+              │                                 │
+              │                       AudioPlaybackService (WasapiOut)
+              │                                 │
+              └──────────────► ConversationHistory ◄── PointParser → FlightPathAnimator
 ```
 
-- **Overlay**: WPF transparent window with `WS_EX_TRANSPARENT | WS_EX_LAYERED` — click-through, always on top
-- **Audio**: WasapiOut shared mode (~10-30ms latency)
-- **API keys**: Stored in Windows Credential Manager; never written to disk in plaintext
+**State machine:** `IDLE → RECORDING → PROCESSING → SPEAKING → IDLE`
+
+Each push-to-talk turn opens a fresh `GeminiLiveService` WebSocket session. The previous session is gracefully torn down before the new one connects, preventing socket leaks. Prior conversation turns are injected into the Gemini `systemInstruction` at setup time (the `initialHistoryInClientContent` API path causes a socket close on `gemini-3.1-flash-live-preview`).
+
+**API key security:** The Gemini key is read from Windows Credential Manager at runtime and passed in memory only. It never appears in config files, logs, or source code.
 
 ---
 
-## Building from source
+## Logs
 
-Requires [.NET 8 SDK](https://dotnet.microsoft.com/download/dotnet/8.0).
-
-```bash
-# Build
-dotnet build src/ClickyWindows/ClickyWindows.csproj
-
-# Release publish (self-contained win-x64, no SDK needed to run)
-dotnet publish src/ClickyWindows/ClickyWindows.csproj \
-  --configuration Release --runtime win-x64 --self-contained true --output dist/
-```
+Logs are written to `%APPDATA%\ClickyWindows\logs\` and rotate daily (7-day retention). They contain no API keys or audio data.
 
 ---
 
 ## Credits
 
 - Original macOS [Clicky](https://github.com/farzaa/clicky) by [@farzaa](https://github.com/farzaa)
-- This Windows port uses WPF, AssemblyAI v3, Claude, and ElevenLabs
+- Audio via [NAudio](https://github.com/naudio/NAudio)
+- AI / STT / TTS via [Google Gemini Live API](https://ai.google.dev/gemini-api/docs/live)
