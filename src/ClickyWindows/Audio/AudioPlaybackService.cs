@@ -12,15 +12,18 @@ public class AudioPlaybackService : IDisposable
     private WasapiOut? _wasapiOut;
     private BufferedWaveProvider? _buffer;
     private readonly int _preBufferMs;
+    private readonly int _bufferSeconds;
+    private readonly SemaphoreSlim _writeLock = new(1, 1);
     private bool _playbackStarted;
     private int _totalBytesBuffered;
     private CancellationTokenSource? _drainCts;
 
     public event Action? PlaybackCompleted;
 
-    public AudioPlaybackService(int preBufferMs = 250)
+    public AudioPlaybackService(int preBufferMs = 250, int bufferSeconds = 45)
     {
         _preBufferMs = preBufferMs;
+        _bufferSeconds = bufferSeconds;
     }
 
     public void Initialize(WaveFormat format)
@@ -29,7 +32,7 @@ public class AudioPlaybackService : IDisposable
 
         _buffer = new BufferedWaveProvider(format)
         {
-            BufferDuration = TimeSpan.FromSeconds(30),
+            BufferDuration = TimeSpan.FromSeconds(_bufferSeconds),
             DiscardOnBufferOverflow = false
         };
 
@@ -41,27 +44,45 @@ public class AudioPlaybackService : IDisposable
     }
 
     /// <summary>
-    /// Add audio data chunk. Starts playback once pre-buffer threshold is met.
+    /// Add audio data chunk with backpressure. Starts playback once pre-buffer threshold is met.
     /// </summary>
-    public void AddData(byte[] data, int count)
+    public async Task AddDataAsync(byte[] data, int count, CancellationToken cancellationToken = default)
     {
         if (_buffer == null) return;
 
-        _buffer.AddSamples(data, 0, count);
-        _totalBytesBuffered += count;
-
-        if (!_playbackStarted)
+        await _writeLock.WaitAsync(cancellationToken);
+        try
         {
-            // Calculate how many bytes = preBufferMs
-            int bytesPerMs = _buffer.WaveFormat.AverageBytesPerSecond / 1000;
-            int threshold = bytesPerMs * _preBufferMs;
-
-            if (_totalBytesBuffered >= threshold)
+            while (_buffer != null && _buffer.BufferedBytes + count > _buffer.BufferLength)
             {
-                _playbackStarted = true;
-                _wasapiOut?.Play();
-                Log.Debug("Playback started after {Ms}ms pre-buffer", _preBufferMs);
+                await Task.Delay(20, cancellationToken);
             }
+
+            if (_buffer == null)
+            {
+                return;
+            }
+
+            _buffer.AddSamples(data, 0, count);
+            _totalBytesBuffered += count;
+
+            if (!_playbackStarted)
+            {
+                // Calculate how many bytes = preBufferMs
+                int bytesPerMs = _buffer.WaveFormat.AverageBytesPerSecond / 1000;
+                int threshold = bytesPerMs * _preBufferMs;
+
+                if (_totalBytesBuffered >= threshold)
+                {
+                    _playbackStarted = true;
+                    _wasapiOut?.Play();
+                    Log.Debug("Playback started after {Ms}ms pre-buffer", _preBufferMs);
+                }
+            }
+        }
+        finally
+        {
+            _writeLock.Release();
         }
     }
 

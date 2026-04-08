@@ -20,100 +20,47 @@ A Windows port of [Clicky](https://github.com/farzaa/clicky) — an AI voice com
 
 ## Prerequisites
 
-You need API keys for:
+You need API keys for three services:
 
 | Service | Purpose | Free tier? |
 |---------|---------|------------|
-| [Anthropic](https://console.anthropic.com/) | Claude AI responses | Pay-per-use |
-| [ElevenLabs](https://elevenlabs.io/) | Text-to-speech voice | Yes (limited) |
-| [AssemblyAI](https://www.assemblyai.com/) | Real-time transcription | Pay-per-use |
+| [Anthropic](https://console.anthropic.com/settings/keys) | Claude AI responses | Pay-per-use |
+| [ElevenLabs](https://elevenlabs.io/app/settings/api-keys) | Text-to-speech voice | Yes (limited) |
+| [AssemblyAI](https://www.assemblyai.com/dashboard) | Real-time transcription | Pay-per-use |
 
-The proxy (`src/ClickyWindows.Proxy/`) is a small Node.js server that holds your Anthropic and ElevenLabs keys — it runs locally on your machine so keys never live inside the app itself.
+No Node.js, no proxy server, no environment variables needed.
 
 ---
 
 ## Setup
 
-### Step 1: Configure the proxy
+1. Download `ClickyWindows.zip` from the [Releases](../../releases) page, extract, and run `ClickyWindows.exe`
+2. A setup wizard appears on first launch — enter your three API keys
+3. Click **Save and Start**
 
-```bash
-cd src/ClickyWindows.Proxy
-npm install
-
-# Copy the example and fill in your keys
-copy dev.vars.example .dev.vars
-```
-
-Edit `.dev.vars`:
-
-```
-ANTHROPIC_API_KEY=sk-ant-...
-ELEVENLABS_API_KEY=sk_...
-ASSEMBLYAI_API_KEY=...
-```
-
-### Step 2: Start the proxy
-
-```bash
-cd src/ClickyWindows.Proxy
-npx wrangler dev
-```
-
-This starts the proxy at `http://localhost:8787`. Leave this terminal running.
-
-> The app's default `ProxyUrl` is already `http://localhost:8787` — no config change needed.
-
-### Step 3: Set your AssemblyAI key
-
-AssemblyAI connects directly from the app via a WebSocket. Set it as a Windows environment variable:
-
-```powershell
-[Environment]::SetEnvironmentVariable("ASSEMBLYAI_API_KEY", "your_key_here", "User")
-```
-
-Then restart your terminal / the app so it picks up the new variable.
-
-### Step 4: Run the app
-
-**Option A — Download pre-built release** (no .NET SDK needed):
-
-Go to the [Releases](../../releases) page and download the latest `ClickyWindows.zip`. Extract and run `ClickyWindows.exe`.
-
-**Option B — Build from source**:
-
-Requires [.NET 8 SDK](https://dotnet.microsoft.com/download/dotnet/8.0).
-
-```bash
-# Quick run (development)
-dotnet run --project src/ClickyWindows
-
-# Self-contained release build (produces ClickyWindows.exe in dist/)
-.\publish\build.ps1
-```
+Keys are stored in **Windows Credential Manager** (not in any file). To update keys later: right-click the tray icon → **Manage API Keys...**
 
 ---
 
 ## Usage
 
-1. Start the proxy (`npx wrangler dev` in `src/ClickyWindows.Proxy/`)
-2. Launch `ClickyWindows.exe` — a tray icon appears
-3. Hold **Ctrl+Alt** and speak your request
-4. Release to stop recording — the app transcribes, sends to Claude, and speaks the response
-5. The blue triangle animates to any screen location Claude references
+1. Launch `ClickyWindows.exe` — a tray icon appears
+2. Hold **Ctrl+Alt** and speak your request
+3. Release to stop recording — the app transcribes, sends to Claude, and speaks the response
+4. The blue triangle animates to any screen location Claude references
 
-**During a response:** Hold Ctrl+Alt again to interrupt TTS and start a new recording.
+**Interrupt:** Hold Ctrl+Alt during a response to stop TTS and start a new recording.
 
-**Exit:** Right-click the tray icon → Exit.
+**Exit:** Right-click the tray icon → Quit.
 
 ---
 
 ## Configuration
 
-`src/ClickyWindows/appsettings.json`:
+`src/ClickyWindows/appsettings.json` (optional overrides):
 
 | Key | Default | Description |
 |-----|---------|-------------|
-| `ProxyUrl` | `http://localhost:8787` | Proxy server URL |
 | `Hotkey.Key` | `Menu` | Push-to-talk key (Menu = Alt) |
 | `Hotkey.Modifiers` | `Control` | Modifier key |
 | `AssemblyAI.SpeechModel` | `u3-rt-pro` | AssemblyAI model |
@@ -123,31 +70,12 @@ dotnet run --project src/ClickyWindows
 
 ---
 
-## Deploying the proxy to Cloudflare (optional)
-
-If you want the proxy running 24/7 without keeping a terminal open, you can deploy it to a free Cloudflare Worker:
-
-```bash
-cd src/ClickyWindows.Proxy
-npx wrangler deploy
-
-# Set secrets in the cloud instead of .dev.vars
-npx wrangler secret put ANTHROPIC_API_KEY
-npx wrangler secret put ELEVENLABS_API_KEY
-npx wrangler secret put ASSEMBLYAI_API_KEY
-```
-
-Then update `ProxyUrl` in `appsettings.json` to your worker URL:
-`https://clicky-windows-proxy.<your-subdomain>.workers.dev`
-
----
-
 ## Architecture
 
 ```
-Hotkey press → MicrophoneRecorder → PCM stream → AssemblyAI v3 WebSocket
+Hotkey press → MicrophoneRecorder → PCM stream → AssemblyAI v3 WebSocket (direct)
                                                         ↓ transcript
-ScreenCaptureService → ClaudeService (SSE via proxy) ← ConversationHistory
+ScreenCaptureService → ClaudeService (SSE, direct) ← ConversationHistory
                               ↓ streamed text
                         PointParser → FlightPathAnimator (Bezier arc overlay)
                               ↓ full text
@@ -156,22 +84,22 @@ ScreenCaptureService → ClaudeService (SSE via proxy) ← ConversationHistory
 
 - **Overlay**: WPF transparent window with `WS_EX_TRANSPARENT | WS_EX_LAYERED` — click-through, always on top
 - **Audio**: WasapiOut shared mode (~10-30ms latency)
-- **Proxy**: Local Wrangler dev server (or Cloudflare Worker) at `/chat` (Anthropic SSE) and `/tts` (ElevenLabs)
+- **API keys**: Stored in Windows Credential Manager; never written to disk in plaintext
 
 ---
 
-## Building / Contributing
+## Building from source
+
+Requires [.NET 8 SDK](https://dotnet.microsoft.com/download/dotnet/8.0).
 
 ```bash
 # Build
 dotnet build src/ClickyWindows/ClickyWindows.csproj
 
-# Release publish (self-contained win-x64)
+# Release publish (self-contained win-x64, no SDK needed to run)
 dotnet publish src/ClickyWindows/ClickyWindows.csproj \
   --configuration Release --runtime win-x64 --self-contained true --output dist/
 ```
-
-.NET 8 SDK required. No test suite yet.
 
 ---
 

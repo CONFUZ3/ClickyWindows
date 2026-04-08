@@ -1,5 +1,6 @@
+using System.IO;
+using System.Net;
 using System.Net.Http;
-using System.Runtime.CompilerServices;
 using System.Text;
 using System.Text.Json;
 using ClickyWindows.Screen;
@@ -8,35 +9,33 @@ using Serilog;
 namespace ClickyWindows.AI;
 
 /// <summary>
-/// Sends requests to the Cloudflare Worker proxy's /chat endpoint.
-/// Parses SSE streaming response from Claude.
+/// Sends requests directly to the Anthropic Messages API and parses SSE streaming responses.
 /// </summary>
 public class ClaudeService
 {
-    private readonly ProxyClient _proxy;
+    private readonly HttpClient _httpClient;
     private readonly AppSettings _settings;
 
-    public ClaudeService(ProxyClient proxy, AppSettings settings)
+    private const string AnthropicEndpoint = "https://api.anthropic.com/v1/messages";
+
+    public ClaudeService(HttpClient httpClient, AppSettings settings)
     {
-        _proxy = proxy;
+        _httpClient = httpClient;
         _settings = settings;
     }
 
-    /// <summary>
-    /// Stream Claude's response. Yields text chunks as they arrive.
-    /// </summary>
-    public async IAsyncEnumerable<string> StreamResponseAsync(
+    public async Task<ClaudeResponseResult> GetResponseAsync(
         string userMessage,
         ConversationHistory history,
         IReadOnlyList<(string Base64Jpeg, int Width, int Height, int MonitorIndex, bool IsFocus)> screenshots,
-        [EnumeratorCancellation] CancellationToken cancellationToken = default)
+        Func<string, CancellationToken, ValueTask>? onTextChunk = null,
+        CancellationToken cancellationToken = default)
     {
         var messages = BuildMessages(userMessage, history, screenshots);
-
         var requestBody = JsonSerializer.Serialize(new
         {
             model = _settings.Claude.Model,
-            max_tokens = 1024,
+            max_tokens = _settings.Claude.MaxTokens,
             stream = true,
             system = BuildSystemPrompt(screenshots.Count),
             messages
@@ -44,62 +43,365 @@ public class ClaudeService
 
         Log.Debug("Claude request: {Chars} chars", requestBody.Length);
 
-        var content = new StringContent(requestBody, Encoding.UTF8, "application/json");
-        HttpResponseMessage response;
-
-        try
+        var attempts = Math.Max(1, _settings.Claude.RetryCount + 1);
+        for (var attempt = 1; attempt <= attempts; attempt++)
         {
-            response = await _proxy.PostAsync("/chat", content,
-                timeout: TimeSpan.FromSeconds(65),
-                cancellationToken: cancellationToken);
+            cancellationToken.ThrowIfCancellationRequested();
 
-            response.EnsureSuccessStatusCode();
+            using var requestCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            requestCts.CancelAfter(TimeSpan.FromSeconds(_settings.Claude.RequestTimeoutSeconds));
+
+            using var request = BuildRequest(requestBody);
+            try
+            {
+                using var response = await _httpClient.SendAsync(
+                    request,
+                    HttpCompletionOption.ResponseHeadersRead,
+                    requestCts.Token);
+
+                if (!response.IsSuccessStatusCode)
+                {
+                    var failure = await BuildHttpFailureAsync(response, cancellationToken);
+                    if (ShouldRetry(failure, attempt, attempts))
+                    {
+                        await DelayBeforeRetryAsync(response, attempt, cancellationToken);
+                        continue;
+                    }
+
+                    Log.Warning("Claude request failed with status {StatusCode}: {Message}", failure.StatusCode, failure.Message);
+                    return new ClaudeResponseResult(ClaudeResponseKind.Failed, string.Empty, false, failure);
+                }
+
+                var result = await ReadStreamAsync(response, onTextChunk, cancellationToken);
+                if (result.Failure is { IsRetryable: true } && string.IsNullOrEmpty(result.Text) && attempt < attempts)
+                {
+                    await DelayBeforeRetryAsync(response, attempt, cancellationToken);
+                    continue;
+                }
+
+                return result;
+            }
+            catch (OperationCanceledException ex) when (!cancellationToken.IsCancellationRequested)
+            {
+                var failure = new ServiceFailure(ServiceFailureKind.Timeout, "Claude request timed out.", IsRetryable: true, Exception: ex);
+                if (ShouldRetry(failure, attempt, attempts))
+                {
+                    await DelayBeforeRetryAsync(null, attempt, cancellationToken);
+                    continue;
+                }
+
+                return new ClaudeResponseResult(ClaudeResponseKind.Failed, string.Empty, false, failure);
+            }
+            catch (HttpRequestException ex)
+            {
+                var failure = new ServiceFailure(ServiceFailureKind.Network, "Claude request failed to reach Anthropic.", IsRetryable: true, Exception: ex);
+                if (ShouldRetry(failure, attempt, attempts))
+                {
+                    await DelayBeforeRetryAsync(null, attempt, cancellationToken);
+                    continue;
+                }
+
+                return new ClaudeResponseResult(ClaudeResponseKind.Failed, string.Empty, false, failure);
+            }
+            catch (OperationCanceledException)
+            {
+                return new ClaudeResponseResult(
+                    ClaudeResponseKind.Cancelled,
+                    string.Empty,
+                    false,
+                    new ServiceFailure(ServiceFailureKind.Cancelled, "Claude request cancelled."));
+            }
+            catch (Exception ex)
+            {
+                Log.Error(ex, "Claude request failed");
+                return new ClaudeResponseResult(
+                    ClaudeResponseKind.Failed,
+                    string.Empty,
+                    false,
+                    new ServiceFailure(ServiceFailureKind.Unknown, "Claude request failed unexpectedly.", Exception: ex));
+            }
         }
-        catch (Exception ex)
-        {
-            Log.Error(ex, "Claude request failed");
-            yield break;
-        }
 
-        await using var stream = await response.Content.ReadAsStreamAsync(cancellationToken);
-        using var reader = new System.IO.StreamReader(stream);
-
-        // SSE line-buffered parsing (handles TCP packet boundary splits)
-        string? line;
-        while ((line = await reader.ReadLineAsync(cancellationToken)) != null)
-        {
-            if (!line.StartsWith("data: ")) continue;
-
-            var data = line[6..];
-            if (data == "[DONE]") break;
-
-            string? chunk = TryExtractTextDelta(data);
-            if (chunk != null)
-                yield return chunk;
-        }
+        return new ClaudeResponseResult(
+            ClaudeResponseKind.Failed,
+            string.Empty,
+            false,
+            new ServiceFailure(ServiceFailureKind.Unknown, "Claude request exhausted all retries."));
     }
 
-    private static string? TryExtractTextDelta(string data)
+    private HttpRequestMessage BuildRequest(string requestBody)
     {
+        var request = new HttpRequestMessage(HttpMethod.Post, AnthropicEndpoint);
+        request.Headers.Add("x-api-key", CredentialStore.GetKey(CredentialStore.AnthropicTarget));
+        request.Headers.Add("anthropic-version", "2023-06-01");
+        request.Content = new StringContent(requestBody, Encoding.UTF8, "application/json");
+        return request;
+    }
+
+    private async Task<ClaudeResponseResult> ReadStreamAsync(
+        HttpResponseMessage response,
+        Func<string, CancellationToken, ValueTask>? onTextChunk,
+        CancellationToken cancellationToken)
+    {
+        await using var stream = await response.Content.ReadAsStreamAsync(cancellationToken);
+        using var reader = new StreamReader(stream);
+
+        var text = new StringBuilder();
+        var dataLines = new List<string>();
+        var currentEvent = "message";
+        var sawMessageStop = false;
+
+        while (true)
+        {
+            string? line;
+            try
+            {
+                line = await reader
+                    .ReadLineAsync(cancellationToken)
+                    .AsTask()
+                    .WaitAsync(TimeSpan.FromSeconds(_settings.Claude.StreamIdleTimeoutSeconds), cancellationToken);
+            }
+            catch (TimeoutException ex)
+            {
+                return new ClaudeResponseResult(
+                    ClaudeResponseKind.Failed,
+                    text.ToString(),
+                    sawMessageStop,
+                    new ServiceFailure(ServiceFailureKind.Timeout, "Claude stream went idle before completion.", IsRetryable: true, Exception: ex));
+            }
+
+            if (line == null)
+            {
+                break;
+            }
+
+            if (line.Length == 0)
+            {
+                var eventResult = await ProcessEventAsync(currentEvent, dataLines, text, onTextChunk, cancellationToken);
+                dataLines.Clear();
+                currentEvent = "message";
+
+                if (eventResult is { Failure: not null } || eventResult?.SawMessageStop == true)
+                {
+                    if (eventResult.SawMessageStop)
+                    {
+                        sawMessageStop = true;
+                        break;
+                    }
+
+                    return new ClaudeResponseResult(
+                        ClaudeResponseKind.Failed,
+                        text.ToString(),
+                        sawMessageStop,
+                        eventResult.Failure);
+                }
+
+                continue;
+            }
+
+            if (line.StartsWith("event:", StringComparison.OrdinalIgnoreCase))
+            {
+                currentEvent = line[6..].Trim();
+                continue;
+            }
+
+            if (line.StartsWith("data:", StringComparison.OrdinalIgnoreCase))
+            {
+                dataLines.Add(line[5..].TrimStart());
+            }
+        }
+
+        if (dataLines.Count > 0)
+        {
+            var trailingEvent = await ProcessEventAsync(currentEvent, dataLines, text, onTextChunk, cancellationToken);
+            if (trailingEvent is { Failure: not null })
+            {
+                return new ClaudeResponseResult(ClaudeResponseKind.Failed, text.ToString(), sawMessageStop, trailingEvent.Failure);
+            }
+
+            sawMessageStop = trailingEvent?.SawMessageStop == true || sawMessageStop;
+        }
+
+        var finalText = text.ToString();
+        if (sawMessageStop)
+        {
+            return string.IsNullOrWhiteSpace(finalText)
+                ? new ClaudeResponseResult(ClaudeResponseKind.Empty, finalText, true)
+                : new ClaudeResponseResult(ClaudeResponseKind.Success, finalText, true);
+        }
+
+        return new ClaudeResponseResult(
+            ClaudeResponseKind.Incomplete,
+            finalText,
+            false,
+            new ServiceFailure(ServiceFailureKind.Upstream, "Claude stream ended before message_stop.", IsRetryable: string.IsNullOrWhiteSpace(finalText)));
+    }
+
+    private async Task<SseEventResult?> ProcessEventAsync(
+        string eventType,
+        List<string> dataLines,
+        StringBuilder text,
+        Func<string, CancellationToken, ValueTask>? onTextChunk,
+        CancellationToken cancellationToken)
+    {
+        if (dataLines.Count == 0)
+        {
+            return null;
+        }
+
+        var data = string.Join("\n", dataLines);
+        if (data == "[DONE]")
+        {
+            return new SseEventResult(SawMessageStop: true);
+        }
+
+        if (string.Equals(eventType, "ping", StringComparison.OrdinalIgnoreCase))
+        {
+            Log.Debug("Claude SSE ping");
+            return null;
+        }
+
         try
         {
             using var doc = JsonDocument.Parse(data);
             var root = doc.RootElement;
+            var type = root.TryGetProperty("type", out var typeProp) ? typeProp.GetString() : eventType;
 
-            // Claude SSE format: {"type":"content_block_delta","delta":{"type":"text_delta","text":"..."}}
-            if (!root.TryGetProperty("type", out var type)) return null;
-            if (type.GetString() != "content_block_delta") return null;
+            if (string.Equals(type, "message_stop", StringComparison.Ordinal))
+            {
+                return new SseEventResult(SawMessageStop: true);
+            }
 
-            if (!root.TryGetProperty("delta", out var delta)) return null;
-            if (!delta.TryGetProperty("text", out var text)) return null;
+            if (string.Equals(type, "error", StringComparison.Ordinal) || string.Equals(eventType, "error", StringComparison.OrdinalIgnoreCase))
+            {
+                return new SseEventResult(Failure: ParseAnthropicError(root));
+            }
 
-            return text.GetString();
+            if (string.Equals(type, "content_block_delta", StringComparison.Ordinal) &&
+                root.TryGetProperty("delta", out var delta) &&
+                delta.TryGetProperty("type", out var deltaType) &&
+                string.Equals(deltaType.GetString(), "text_delta", StringComparison.Ordinal) &&
+                delta.TryGetProperty("text", out var textElement))
+            {
+                var chunk = textElement.GetString();
+                if (!string.IsNullOrEmpty(chunk))
+                {
+                    text.Append(chunk);
+                    if (onTextChunk != null)
+                    {
+                        await onTextChunk(chunk, cancellationToken);
+                    }
+                }
+            }
+
+            return null;
+        }
+        catch (JsonException ex)
+        {
+            return new SseEventResult(
+                Failure: new ServiceFailure(ServiceFailureKind.Upstream, "Claude stream returned invalid JSON.", IsRetryable: text.Length == 0, Exception: ex));
+        }
+    }
+
+    private async Task<ServiceFailure> BuildHttpFailureAsync(HttpResponseMessage response, CancellationToken cancellationToken)
+    {
+        string responseBody;
+        try
+        {
+            responseBody = await response.Content.ReadAsStringAsync(cancellationToken);
         }
         catch
         {
-            return null;
+            responseBody = string.Empty;
         }
+
+        var statusCode = (int)response.StatusCode;
+        var message = $"Anthropic returned HTTP {statusCode}.";
+        try
+        {
+            using var doc = JsonDocument.Parse(responseBody);
+            if (doc.RootElement.TryGetProperty("error", out var error) &&
+                error.TryGetProperty("message", out var errorMessage))
+            {
+                message = errorMessage.GetString() ?? message;
+            }
+        }
+        catch
+        {
+            if (!string.IsNullOrWhiteSpace(responseBody))
+            {
+                message = responseBody.Trim();
+            }
+        }
+
+        var kind = response.StatusCode switch
+        {
+            HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden => ServiceFailureKind.Authentication,
+            HttpStatusCode.TooManyRequests => ServiceFailureKind.RateLimited,
+            HttpStatusCode.RequestTimeout or HttpStatusCode.GatewayTimeout => ServiceFailureKind.Timeout,
+            HttpStatusCode.BadRequest or HttpStatusCode.NotFound or HttpStatusCode.UnprocessableContent => ServiceFailureKind.InvalidRequest,
+            _ when statusCode >= 500 => ServiceFailureKind.Upstream,
+            _ => ServiceFailureKind.Unknown
+        };
+
+        if (kind == ServiceFailureKind.Authentication)
+        {
+            message = "Anthropic authentication failed. Check the stored API key for this machine.";
+        }
+        else if (kind == ServiceFailureKind.RateLimited)
+        {
+            message = "Anthropic rate limited the request. The app will retry when allowed.";
+        }
+
+        var retryable = response.StatusCode == HttpStatusCode.TooManyRequests || statusCode >= 500;
+        return new ServiceFailure(kind, message, statusCode, retryable);
     }
+
+    private static ServiceFailure ParseAnthropicError(JsonElement root)
+    {
+        if (root.TryGetProperty("error", out var errorElement))
+        {
+            var type = errorElement.TryGetProperty("type", out var typeElement)
+                ? typeElement.GetString()
+                : null;
+            var message = errorElement.TryGetProperty("message", out var messageElement)
+                ? messageElement.GetString() ?? "Claude returned an error event."
+                : "Claude returned an error event.";
+
+            return type switch
+            {
+                "rate_limit_error" => new ServiceFailure(ServiceFailureKind.RateLimited, message, IsRetryable: true),
+                "overloaded_error" => new ServiceFailure(ServiceFailureKind.Upstream, message, IsRetryable: true),
+                "authentication_error" or "permission_error" => new ServiceFailure(ServiceFailureKind.Authentication, message),
+                "invalid_request_error" => new ServiceFailure(ServiceFailureKind.InvalidRequest, message),
+                _ => new ServiceFailure(ServiceFailureKind.Upstream, message)
+            };
+        }
+
+        return new ServiceFailure(ServiceFailureKind.Upstream, "Claude returned an unknown error event.");
+    }
+
+    private static bool ShouldRetry(ServiceFailure failure, int attempt, int maxAttempts) =>
+        failure.IsRetryable && attempt < maxAttempts;
+
+    private async Task DelayBeforeRetryAsync(HttpResponseMessage? response, int attempt, CancellationToken cancellationToken)
+    {
+        var retryDelay = response?.Headers.RetryAfter?.Delta;
+        if (retryDelay == null && response?.Headers.RetryAfter?.Date is DateTimeOffset retryAt)
+        {
+            retryDelay = retryAt - DateTimeOffset.UtcNow;
+        }
+
+        var delay = retryDelay.GetValueOrDefault(TimeSpan.FromMilliseconds(_settings.Claude.RetryBaseDelayMs * attempt));
+        if (delay < TimeSpan.Zero)
+        {
+            delay = TimeSpan.Zero;
+        }
+
+        await Task.Delay(delay, cancellationToken);
+    }
+
+    private sealed record SseEventResult(bool SawMessageStop = false, ServiceFailure? Failure = null);
 
     private static string BuildSystemPrompt(int screenshotCount)
     {

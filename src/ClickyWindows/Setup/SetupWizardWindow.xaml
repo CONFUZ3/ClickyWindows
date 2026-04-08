@@ -1,0 +1,84 @@
+<Window x:Class="ClickyWindows.Setup.SetupWizardWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Clicky for Windows — Setup"
+        Width="480" SizeToContent="Height"
+        ResizeMode="NoResize"
+        WindowStartupLocation="CenterScreen"
+        WindowStyle="SingleBorderWindow"
+        ShowInTaskbar="True">
+
+    <Window.Resources>
+        <Style x:Key="Label" TargetType="TextBlock">
+            <Setter Property="FontWeight" Value="SemiBold"/>
+            <Setter Property="Margin" Value="0,0,0,3"/>
+        </Style>
+        <Style x:Key="Link" TargetType="TextBlock">
+            <Setter Property="Margin" Value="0,0,0,6"/>
+            <Setter Property="Foreground" Value="#0066CC"/>
+            <Setter Property="FontSize" Value="11"/>
+        </Style>
+        <Style TargetType="PasswordBox">
+            <Setter Property="Height" Value="28"/>
+            <Setter Property="Padding" Value="4,2"/>
+            <Setter Property="FontSize" Value="13"/>
+            <Setter Property="Margin" Value="0,0,0,16"/>
+        </Style>
+    </Window.Resources>
+
+    <StackPanel Margin="28,24,28,24">
+
+        <TextBlock Text="Welcome to Clicky for Windows"
+                   FontSize="18" FontWeight="Bold" Margin="0,0,0,6"/>
+        <TextBlock TextWrapping="Wrap" Margin="0,0,0,20" Foreground="#555">
+            Enter your three API keys below. They are stored securely in Windows
+            Credential Manager — never saved to any file.
+        </TextBlock>
+
+        <!-- Anthropic -->
+        <TextBlock Style="{StaticResource Label}" Text="Anthropic API Key"/>
+        <TextBlock Style="{StaticResource Link}">
+            <Hyperlink NavigateUri="https://console.anthropic.com/settings/keys"
+                       RequestNavigate="OnLinkNavigate">
+                Get your key at console.anthropic.com →
+            </Hyperlink>
+        </TextBlock>
+        <PasswordBox x:Name="AnthropicKeyBox"/>
+
+        <!-- ElevenLabs -->
+        <TextBlock Style="{StaticResource Label}" Text="ElevenLabs API Key"/>
+        <TextBlock Style="{StaticResource Link}">
+            <Hyperlink NavigateUri="https://elevenlabs.io/app/settings/api-keys"
+                       RequestNavigate="OnLinkNavigate">
+                Get your key at elevenlabs.io →
+            </Hyperlink>
+        </TextBlock>
+        <PasswordBox x:Name="ElevenLabsKeyBox"/>
+
+        <!-- AssemblyAI -->
+        <TextBlock Style="{StaticResource Label}" Text="AssemblyAI API Key"/>
+        <TextBlock Style="{StaticResource Link}">
+            <Hyperlink NavigateUri="https://www.assemblyai.com/dashboard"
+                       RequestNavigate="OnLinkNavigate">
+                Get your key at assemblyai.com →
+            </Hyperlink>
+        </TextBlock>
+        <PasswordBox x:Name="AssemblyAIKeyBox"/>
+
+        <!-- Error -->
+        <TextBlock x:Name="ErrorText"
+                   Foreground="#CC0000"
+                   TextWrapping="Wrap"
+                   Margin="0,0,0,10"
+                   Visibility="Collapsed"/>
+
+        <!-- Buttons -->
+        <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
+            <Button Content="Cancel" Width="80" Margin="0,0,10,0"
+                    Click="OnCancel"/>
+            <Button Content="Save and Start" Width="120"
+                    IsDefault="True" Click="OnSave"/>
+        </StackPanel>
+
+    </StackPanel>
+</Window>

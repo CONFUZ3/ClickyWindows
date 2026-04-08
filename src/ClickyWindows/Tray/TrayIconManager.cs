@@ -2,6 +2,7 @@ using System.Drawing;
 using System.IO;
 using System.Windows.Forms;
 using ClickyWindows.Input;
+using ClickyWindows.Setup;
 using Serilog;
 
 namespace ClickyWindows.Tray;
@@ -29,9 +30,9 @@ public class TrayIconManager : IDisposable
         _menu = new ContextMenuStrip();
         _menu.Items.Add("Clicky for Windows").Enabled = false;
         _menu.Items.Add(new ToolStripSeparator());
-        _menu.Items.Add("Proxy: " + ShortenUrl(_settings.ProxyUrl)).Enabled = false;
         _menu.Items.Add("Hotkey: Ctrl+Alt (hold to talk)").Enabled = false;
         _menu.Items.Add(new ToolStripSeparator());
+        _menu.Items.Add("Manage API Keys...", null, OnManageKeys);
         _menu.Items.Add("Open Log Folder", null, OnOpenLogFolder);
         _menu.Items.Add(new ToolStripSeparator());
         _menu.Items.Add("Quit", null, OnQuit);
@@ -60,10 +61,10 @@ public class TrayIconManager : IDisposable
         Log.Information("Tray icon initialized");
     }
 
-    private static string ShortenUrl(string url)
+    private void OnManageKeys(object? sender, EventArgs e)
     {
-        if (url.Length <= 40) return url;
-        return url[..20] + "..." + url[^15..];
+        var wizard = new SetupWizardWindow(prePopulate: true);
+        wizard.Show();
     }
 
     private void OnOpenLogFolder(object? sender, EventArgs e)

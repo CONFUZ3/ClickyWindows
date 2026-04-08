@@ -1,3 +1,4 @@
+using System.Net.Http;
 using System.Text;
 using System.Windows;
 using ClickyWindows.AI;
@@ -18,23 +19,31 @@ public class PushToTalkController : IDisposable
     private readonly AppSettings _settings;
     private AppState _state = AppState.Idle;
     private readonly object _stateLock = new();
+    private readonly object _audioBufferLock = new();
+    private readonly SemaphoreSlim _audioSendLock = new(1, 1);
 
-    // Services (initialized lazily once proxy URL is set)
-    private ProxyClient? _proxy;
-    private TranscriptionService? _transcription;
+    // Services (initialized on startup after keys are confirmed present)
+    private HttpClient? _httpClient;
     private ClaudeService? _claude;
     private TtsService? _tts;
-    private AudioPlaybackService _playback;
-    private MicrophoneRecorder _recorder;
-    private ScreenCaptureService _screenCapture;
-    private ConversationHistory _history;
+    private readonly AudioPlaybackService _playback;
+    private readonly MicrophoneRecorder _recorder;
+    private readonly ScreenCaptureService _screenCapture;
+    private readonly ConversationHistory _history;
+    private readonly string? _assemblyAiApiKey;
 
     private CancellationTokenSource? _interactionCts;
+    private Task? _interactionTask;
+    private Task? _transcriptionConnectTask;
+    private TranscriptionService? _transcriptionSession;
     private string _currentTranscript = "";
     private readonly StringBuilder _currentResponse = new();
-    // Set to true once a finalized transcript is received for the current interaction,
-    // so OnTranscriptionSessionEnded won't race and idle out a Claude call in progress.
     private volatile bool _transcriptReceived;
+    private bool _recordingReleased;
+    private bool _transcriptionTerminationRequested;
+    private int _turnCounter;
+    private int _activeTurnId;
+    private readonly Queue<byte[]> _pendingAudioBuffers = new();
 
     private static readonly string[] NavigationPhrases =
         ["right here!", "click this!", "this one!", "over here!", "found it!"];
@@ -44,9 +53,10 @@ public class PushToTalkController : IDisposable
         _overlay = overlay;
         _settings = settings;
         _recorder = new MicrophoneRecorder();
-        _playback = new AudioPlaybackService(settings.Audio.PreBufferMs);
+        _playback = new AudioPlaybackService(settings.Audio.PreBufferMs, settings.Audio.PlaybackBufferSeconds);
         _screenCapture = new ScreenCaptureService();
         _history = new ConversationHistory(settings.Claude.MaxHistory);
+        _assemblyAiApiKey = CredentialStore.GetKey(CredentialStore.AssemblyAITarget);
 
         _recorder.LevelsUpdated += levels =>
         {
@@ -61,28 +71,17 @@ public class PushToTalkController : IDisposable
 
     private void InitializeServices()
     {
-        if (string.IsNullOrWhiteSpace(_settings.ProxyUrl) ||
-            _settings.ProxyUrl.Contains("your-worker"))
+        if (!CredentialStore.HasAllKeys())
         {
-            Log.Warning("Proxy URL not configured — AI features disabled. Edit appsettings.json.");
+            Log.Warning(
+                "API keys not configured for direct mode ({MissingKeys}) — AI features disabled.",
+                string.Join(", ", CredentialStore.GetMissingKeyNames()));
             return;
         }
 
-        _proxy = new ProxyClient(_settings.ProxyUrl);
-        _claude = new ClaudeService(_proxy, _settings);
-        _tts = new TtsService(_proxy, _settings, _playback);
-
-        // AssemblyAI key is handled by the proxy — pass empty for now
-        // In production, the proxy forwards audio to AssemblyAI
-        // For direct use, set the key via environment variable ASSEMBLYAI_API_KEY
-        var assemblyKey = Environment.GetEnvironmentVariable("ASSEMBLYAI_API_KEY") ?? "";
-        _transcription = new TranscriptionService(assemblyKey, _settings);
-        _transcription.TranscriptFinalized += OnTranscriptFinalized;
-        _transcription.SessionEnded += OnTranscriptionSessionEnded;
-        _transcription.PartialTranscript += _ =>
-            Log.Debug("Partial transcript received");
-        _transcription.Error += ex =>
-            Log.Error(ex, "Transcription error");
+        _httpClient = new HttpClient { Timeout = System.Threading.Timeout.InfiniteTimeSpan };
+        _claude = new ClaudeService(_httpClient, _settings);
+        _tts = new TtsService(_httpClient, _settings, _playback);
     }
 
     public void OnHotkeyPressed()
@@ -91,15 +90,13 @@ public class PushToTalkController : IDisposable
         {
             if (_state == AppState.Speaking)
             {
-                // Echo prevention: stop TTS, then start recording
                 Log.Debug("Hotkey pressed during SPEAKING — stopping TTS");
-                _playback.Stop();
-                // Will transition via OnPlaybackCompleted or directly
+                CancelCurrentTurnLocked();
             }
 
             if (_state == AppState.Idle || _state == AppState.Speaking)
             {
-                StartRecording();
+                StartRecordingLocked();
             }
         }
     }
@@ -113,50 +110,108 @@ public class PushToTalkController : IDisposable
         }
     }
 
-    private void StartRecording()
+    private void StartRecordingLocked()
     {
+        if (_claude == null || _tts == null)
+        {
+            Log.Warning("AI services not initialized");
+            return;
+        }
+
+        var turnId = Interlocked.Increment(ref _turnCounter);
+        _activeTurnId = turnId;
+
         Log.Information("State: RECORDING");
         _state = AppState.Recording;
+        _interactionCts?.Dispose();
         _interactionCts = new CancellationTokenSource();
+        _interactionTask = null;
         _currentTranscript = "";
         _currentResponse.Clear();
         _transcriptReceived = false;
+        _recordingReleased = false;
+        _transcriptionTerminationRequested = false;
+        ClearPendingAudio();
 
         System.Windows.Application.Current?.Dispatcher.Invoke(() =>
             _overlay.SetState(AppState.Recording));
 
+        var transcriptionSession = CreateTranscriptionSession();
+        _transcriptionSession = transcriptionSession;
+
         _recorder.StartRecording();
         _recorder.DataAvailable += OnAudioData;
 
-        // Connect transcription WebSocket
-        _ = ConnectTranscriptionAsync(_interactionCts.Token);
+        _transcriptionConnectTask = RunTranscriptionSessionAsync(turnId, transcriptionSession, _interactionCts.Token);
     }
 
-    private async Task ConnectTranscriptionAsync(CancellationToken token)
+    private TranscriptionService CreateTranscriptionSession()
     {
-        if (_transcription == null)
-        {
-            Log.Warning("Transcription service not initialized (proxy not configured)");
-            return;
-        }
+        var session = new TranscriptionService(_assemblyAiApiKey ?? string.Empty, _settings);
+        session.TranscriptFinalized += transcript => OnTranscriptFinalized(session, transcript);
+        session.SessionEnded += endedEvent => OnTranscriptionSessionEnded(session, endedEvent);
+        session.PartialTranscript += _ => Log.Debug("Partial transcript received");
+        session.Error += ex => Log.Error(ex, "Transcription error");
+        return session;
+    }
 
+    private async Task RunTranscriptionSessionAsync(int turnId, TranscriptionService session, CancellationToken token)
+    {
         try
         {
-            await _transcription.ConnectAsync(token);
+            var connected = await session.ConnectAsync(token);
+            if (!IsActiveTurn(turnId, session))
+            {
+                await DisposeSessionAsync(session);
+                return;
+            }
+
+            if (!connected)
+            {
+                await HandleTranscriptionUnavailableAsync(turnId, session, session.LastFailure?.Message ?? "Failed to connect to AssemblyAI.");
+                return;
+            }
+
+            await FlushBufferedAudioAsync(turnId, session, token);
+            if (_recordingReleased)
+            {
+                await FinalizeTranscriptionAsync(turnId, session, token);
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            // Turn cancellation is expected during interruption or shutdown.
         }
         catch (Exception ex)
         {
             Log.Error(ex, "Failed to connect transcription WebSocket");
+            if (IsActiveTurn(turnId, session))
+            {
+                await HandleTranscriptionUnavailableAsync(turnId, session, "Failed to connect to AssemblyAI.");
+            }
         }
     }
 
     private async void OnAudioData(byte[] buffer, int count)
     {
-        if (_transcription == null || _interactionCts?.IsCancellationRequested == true) return;
+        var session = _transcriptionSession;
+        var token = _interactionCts?.Token ?? CancellationToken.None;
+        var turnId = _activeTurnId;
+        if (session == null || token.IsCancellationRequested)
+        {
+            return;
+        }
 
         try
         {
-            await _transcription.SendAudioAsync(buffer, count, _interactionCts?.Token ?? CancellationToken.None);
+            if (session.IsReady)
+            {
+                await SendAudioChunkAsync(turnId, session, buffer, count, token);
+            }
+            else
+            {
+                BufferAudio(buffer, count);
+            }
         }
         catch (Exception ex)
         {
@@ -174,83 +229,111 @@ public class PushToTalkController : IDisposable
 
         _recorder.DataAvailable -= OnAudioData;
         _recorder.StopRecording();
+        _recordingReleased = true;
 
-        // If no transcription service configured, or the WebSocket never opened
-        // (e.g., bad API key, network failure), SessionEnded will never fire — go idle now.
-        if (_transcription == null || !_transcription.HasActiveSession)
+        if (_transcriptionSession == null)
         {
-            Log.Warning("No active transcription session — returning to idle");
-            TransitionToIdle();
+            Log.Warning("No transcription session for current turn — returning to idle");
+            TransitionToIdle(_activeTurnId);
             return;
         }
 
-        // Send Terminate to flush any buffered audio; wait for TranscriptFinalized or SessionEnded.
-        _ = TerminateTranscriptionAsync();
+        if (_transcriptionSession.IsReady)
+        {
+            _ = FinalizeTranscriptionAsync(_activeTurnId, _transcriptionSession, _interactionCts?.Token ?? CancellationToken.None);
+            return;
+        }
+
+        if (_transcriptionSession.IsTerminal)
+        {
+            Log.Warning("Transcription session ended before ready — returning to idle");
+            TransitionToIdle(_activeTurnId);
+            return;
+        }
+
+        Log.Debug("Waiting for AssemblyAI session to become ready before flushing buffered audio");
     }
 
-    private async Task TerminateTranscriptionAsync()
+    private async Task FinalizeTranscriptionAsync(int turnId, TranscriptionService session, CancellationToken token)
     {
-        if (_transcription == null) return;
+        if (!IsActiveTurn(turnId, session) || _transcriptionTerminationRequested)
+        {
+            return;
+        }
+
+        _transcriptionTerminationRequested = true;
+
         try
         {
-            await _transcription.TerminateAsync();
+            await FlushBufferedAudioAsync(turnId, session, token);
+            await session.TerminateAsync(token);
         }
         catch (Exception ex)
         {
             Log.Warning(ex, "Failed to terminate transcription session");
+            TransitionToIdle(turnId);
         }
     }
 
-    private void OnTranscriptFinalized(string transcript)
+    private void OnTranscriptFinalized(TranscriptionService session, string transcript)
     {
-        // Guard: only act when we're actually waiting for a transcript.
-        lock (_stateLock)
+        var turnId = _activeTurnId;
+        if (!IsActiveTurn(turnId, session))
         {
-            if (_state != AppState.Processing) return;
+            return;
         }
 
         if (string.IsNullOrWhiteSpace(transcript))
         {
-            TransitionToIdle();
+            TransitionToIdle(turnId);
             return;
         }
 
-        // Mark before starting async work so OnTranscriptionSessionEnded
-        // doesn't race and idle out the in-progress Claude call.
-        _transcriptReceived = true;
+        if (_transcriptReceived)
+        {
+            return;
+        }
 
+        _transcriptReceived = true;
         _currentTranscript = transcript;
         Log.Information("Transcript received ({Length} chars)", transcript.Length);
         _history.AddUserMessage(transcript);
 
-        _ = RunClaudeAsync(transcript, _interactionCts?.Token ?? CancellationToken.None);
+        _interactionTask = RunClaudeAsync(turnId, transcript, _interactionCts?.Token ?? CancellationToken.None);
     }
 
-    /// <summary>
-    /// Called when the AssemblyAI WebSocket closes (normally, on error, or after Terminate).
-    /// If we're still in PROCESSING and no transcript arrived, nothing else will unblock us — go idle.
-    /// </summary>
-    private void OnTranscriptionSessionEnded()
+    private void OnTranscriptionSessionEnded(TranscriptionService session, TranscriptionSessionEndedEvent endedEvent)
     {
+        var turnId = _activeTurnId;
+        if (!ReferenceEquals(session, _transcriptionSession))
+        {
+            _ = DisposeSessionAsync(session);
+            return;
+        }
+
+        LogSessionEnded(endedEvent);
+        _ = DisposeSessionAsync(session);
+        _transcriptionSession = null;
+
         bool shouldIdle;
         lock (_stateLock)
         {
-            shouldIdle = _state == AppState.Processing && !_transcriptReceived;
+            shouldIdle = (_state == AppState.Recording || _state == AppState.Processing) && !_transcriptReceived;
         }
 
-        if (shouldIdle)
+        if (shouldIdle && turnId == _activeTurnId)
         {
             Log.Warning("Transcription session ended with no transcript — returning to idle");
-            System.Windows.Application.Current?.Dispatcher.Invoke(TransitionToIdle);
+            TransitionToIdle(turnId);
         }
     }
 
-    private async Task RunClaudeAsync(string userMessage, CancellationToken token)
+    private async Task RunClaudeAsync(int turnId, string userMessage, CancellationToken token)
     {
         if (_claude == null || _tts == null)
         {
             Log.Warning("AI services not initialized");
-            TransitionToIdle();
+            TransitionToIdle(turnId);
             return;
         }
 
@@ -265,36 +348,60 @@ public class PushToTalkController : IDisposable
 
         try
         {
-            await foreach (var chunk in _claude.StreamResponseAsync(userMessage, _history, screenshotTuples, token))
-            {
-                _currentResponse.Append(chunk);
+            var claudeResult = await _claude.GetResponseAsync(
+                userMessage,
+                _history,
+                screenshotTuples,
+                (chunk, cancellationToken) =>
+                {
+                    if (!IsActiveTurn(turnId))
+                    {
+                        return ValueTask.CompletedTask;
+                    }
 
-                // Parse POINT tags mid-stream
-                var newPoints = PointParser.ParseAll(chunk, monitors);
-                pointsFound.AddRange(newPoints);
+                    _currentResponse.Append(chunk);
+                    var newPoints = PointParser.ParseAll(chunk, monitors);
+                    pointsFound.AddRange(newPoints);
+                    return ValueTask.CompletedTask;
+                },
+                token);
+
+            if (!IsActiveTurn(turnId))
+            {
+                return;
             }
 
-            var fullResponse = _currentResponse.ToString();
+            if (claudeResult.Kind == ClaudeResponseKind.Cancelled)
+            {
+                TransitionToIdle(turnId);
+                return;
+            }
+
+            if (claudeResult.Kind is ClaudeResponseKind.Failed or ClaudeResponseKind.Incomplete)
+            {
+                Log.Warning("Claude failed: {Message}", claudeResult.Failure?.Message ?? "unknown error");
+                TransitionToIdle(turnId);
+                return;
+            }
+
+            var fullResponse = claudeResult.Text;
 
             Log.Information("Claude response: {Chars} chars, {Points} points",
                 fullResponse.Length, pointsFound.Count);
 
             if (string.IsNullOrWhiteSpace(fullResponse))
             {
-                // Claude returned nothing (e.g., proxy error) — go back to idle
-                TransitionToIdle();
+                TransitionToIdle(turnId);
                 return;
             }
 
             _history.AddAssistantMessage(fullResponse);
 
-            // Transition to speaking
             Log.Information("State: SPEAKING");
             _state = AppState.Speaking;
             System.Windows.Application.Current?.Dispatcher.Invoke(() =>
                 _overlay.SetState(AppState.Speaking));
 
-            // Animate to first POINT if present
             if (pointsFound.Count > 0)
             {
                 var pt = pointsFound[0];
@@ -311,36 +418,161 @@ public class PushToTalkController : IDisposable
                 });
             }
 
-            // Speak the response (strip POINT tags for TTS)
             var ttsText = System.Text.RegularExpressions.Regex.Replace(
                 fullResponse, @"\[POINT:[^\]]+\]", "");
+            var ttsTextTrimmed = ttsText.Trim();
+            if (string.IsNullOrWhiteSpace(ttsTextTrimmed))
+            {
+                TransitionToIdle(turnId);
+                return;
+            }
 
-            await _tts.SpeakAsync(ttsText.Trim(), token);
+            var speechResult = await _tts.SpeakAsync(ttsTextTrimmed, token);
+            if (!IsActiveTurn(turnId))
+            {
+                return;
+            }
+
+            if (speechResult.Kind is SpeechResultKind.Cancelled or SpeechResultKind.Failed)
+            {
+                if (speechResult.Failure != null)
+                {
+                    Log.Warning("TTS failed: {Message}", speechResult.Failure.Message);
+                }
+
+                TransitionToIdle(turnId);
+            }
         }
         catch (OperationCanceledException)
         {
             Log.Debug("Claude/TTS interaction cancelled");
-            TransitionToIdle();
+            TransitionToIdle(turnId);
         }
         catch (Exception ex)
         {
             Log.Error(ex, "Error during Claude/TTS interaction");
-            TransitionToIdle();
+            TransitionToIdle(turnId);
         }
     }
 
     private void OnPlaybackCompleted()
     {
-        System.Windows.Application.Current?.Dispatcher.Invoke(TransitionToIdle);
-    }
-
-    private void TransitionToIdle()
-    {
+        int turnId;
         lock (_stateLock)
         {
+            if (_state != AppState.Speaking)
+            {
+                return;
+            }
+
+            turnId = _activeTurnId;
+        }
+
+        TransitionToIdle(turnId);
+    }
+
+    private async Task SendAudioChunkAsync(int turnId, TranscriptionService session, byte[] buffer, int count, CancellationToken token)
+    {
+        await _audioSendLock.WaitAsync(token);
+        try
+        {
+            if (!IsActiveTurn(turnId, session))
+            {
+                return;
+            }
+
+            await session.SendAudioAsync(buffer, count, token);
+        }
+        finally
+        {
+            _audioSendLock.Release();
+        }
+    }
+
+    private async Task FlushBufferedAudioAsync(int turnId, TranscriptionService session, CancellationToken token)
+    {
+        while (true)
+        {
+            byte[]? bufferedChunk;
+            lock (_audioBufferLock)
+            {
+                if (_pendingAudioBuffers.Count == 0)
+                {
+                    break;
+                }
+
+                bufferedChunk = _pendingAudioBuffers.Dequeue();
+            }
+
+            await SendAudioChunkAsync(turnId, session, bufferedChunk, bufferedChunk.Length, token);
+        }
+    }
+
+    private void BufferAudio(byte[] buffer, int count)
+    {
+        var copy = new byte[count];
+        Buffer.BlockCopy(buffer, 0, copy, 0, count);
+
+        lock (_audioBufferLock)
+        {
+            _pendingAudioBuffers.Enqueue(copy);
+        }
+    }
+
+    private void ClearPendingAudio()
+    {
+        lock (_audioBufferLock)
+        {
+            _pendingAudioBuffers.Clear();
+        }
+    }
+
+    private async Task HandleTranscriptionUnavailableAsync(int turnId, TranscriptionService session, string reason)
+    {
+        if (!IsActiveTurn(turnId, session))
+        {
+            await DisposeSessionAsync(session);
+            return;
+        }
+
+        Log.Warning("Transcription unavailable: {Reason}", reason);
+        _recorder.DataAvailable -= OnAudioData;
+        _recorder.StopRecording();
+        await DisposeSessionAsync(session);
+        _transcriptionSession = null;
+        TransitionToIdle(turnId);
+    }
+
+    private bool IsActiveTurn(int turnId) => turnId == _activeTurnId;
+
+    private bool IsActiveTurn(int turnId, TranscriptionService session) =>
+        IsActiveTurn(turnId) && ReferenceEquals(session, _transcriptionSession);
+
+    private void TransitionToIdle(int turnId)
+    {
+        if (!IsActiveTurn(turnId))
+        {
+            return;
+        }
+
+        lock (_stateLock)
+        {
+            if (turnId != _activeTurnId)
+            {
+                return;
+            }
+
             Log.Information("State: IDLE");
             _state = AppState.Idle;
         }
+
+        _recordingReleased = false;
+        _transcriptionTerminationRequested = false;
+        _recorder.DataAvailable -= OnAudioData;
+        _recorder.StopRecording();
+        ClearPendingAudio();
+        _interactionCts?.Cancel();
+
         System.Windows.Application.Current?.Dispatcher.Invoke(() =>
         {
             _overlay.SetState(AppState.Idle);
@@ -348,11 +580,68 @@ public class PushToTalkController : IDisposable
         });
     }
 
+    private void CancelCurrentTurnLocked()
+    {
+        _interactionCts?.Cancel();
+        _interactionCts?.Dispose();
+        _interactionCts = null;
+        _recorder.DataAvailable -= OnAudioData;
+        _recorder.StopRecording();
+        _playback.Stop();
+        ClearPendingAudio();
+        _recordingReleased = false;
+        _transcriptionTerminationRequested = false;
+
+        if (_transcriptionSession != null)
+        {
+            var session = _transcriptionSession;
+            _transcriptionSession = null;
+            _ = DisposeSessionAsync(session);
+        }
+    }
+
+    private static async Task DisposeSessionAsync(TranscriptionService session)
+    {
+        try
+        {
+            await session.DisposeAsync();
+        }
+        catch (Exception ex)
+        {
+            Log.Debug(ex, "Ignored transcription session dispose failure");
+        }
+    }
+
+    private static void LogSessionEnded(TranscriptionSessionEndedEvent endedEvent)
+    {
+        if (endedEvent.Kind == TranscriptionEndKind.Completed)
+        {
+            Log.Information(
+                "AssemblyAI session ended: {SessionId} ({CloseStatus} {Description})",
+                endedEvent.SessionId ?? "(unknown)",
+                endedEvent.CloseStatus,
+                endedEvent.CloseStatusDescription);
+            return;
+        }
+
+        Log.Warning(
+            "AssemblyAI session ended with {Kind}: {SessionId} {Message}",
+            endedEvent.Kind,
+            endedEvent.SessionId ?? "(unknown)",
+            endedEvent.Failure?.Message ?? endedEvent.CloseStatusDescription ?? "(no details)");
+    }
+
     public void Dispose()
     {
+        lock (_stateLock)
+        {
+            CancelCurrentTurnLocked();
+        }
+
         _interactionCts?.Cancel();
         _recorder.Dispose();
         _playback.Dispose();
-        _proxy?.Dispose();
+        _httpClient?.Dispose();
+        _audioSendLock.Dispose();
     }
 }

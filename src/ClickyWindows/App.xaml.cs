@@ -1,8 +1,10 @@
 using System.IO;
 using System.Text.Json;
 using System.Windows;
+using ClickyWindows.AI;
 using ClickyWindows.Input;
 using ClickyWindows.Overlay;
+using ClickyWindows.Setup;
 using ClickyWindows.Tray;
 using Serilog;
 
@@ -26,6 +28,17 @@ public partial class App : System.Windows.Application
         Log.Information("ClickyWindows starting up");
 
         SetupGlobalExceptionHandlers();
+
+        if (!CredentialStore.HasAllKeys())
+        {
+            Log.Warning("Missing API keys: {MissingKeys}", string.Join(", ", CredentialStore.GetMissingKeyNames()));
+            var wizard = new SetupWizardWindow();
+            if (wizard.ShowDialog() != true)
+            {
+                Shutdown(0);
+                return;
+            }
+        }
 
         _overlayManager = new OverlayManager();
         _overlayManager.Initialize();
