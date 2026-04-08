@@ -1,0 +1,50 @@
+# OS/editor
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+.vscode/
+.idea/
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+src/ClickyWindows.Proxy/.dev.vars
+**/.dev.vars
+**/.dev.vars.*
+!**/dev.vars.example
+
+# Node.js
+node_modules/
+**/node_modules/
+dist/
+coverage/
+.wrangler/
+
+# .NET / C#
+bin/
+obj/
+publish/
+TestResults/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+
+# Build outputs and caches
+artifacts/
+out/
+tmp/
+temp/
+.cache/
+
+# Internal planning docs
+plan.md
