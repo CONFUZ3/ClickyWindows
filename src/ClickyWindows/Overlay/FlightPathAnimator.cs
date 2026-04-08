@@ -17,7 +17,7 @@ public class FlightPathAnimator
     public bool IsFlying => _isFlying;
     public System.Windows.Point CurrentPosition { get; private set; }
 
-    public FlightPathAnimator(System.Windows.Point start, System.Windows.Point end, double duration = 0.8)
+    public FlightPathAnimator(System.Windows.Point start, System.Windows.Point end, double duration = 0.4)
     {
         _start = start;
         _end = end;
@@ -27,8 +27,8 @@ public class FlightPathAnimator
         // Build an arc: control points create a swooping Bezier curve
         double dx = end.X - start.X;
         double dy = end.Y - start.Y;
-        double perpX = -dy * 0.4;
-        double perpY = dx * 0.4;
+        double perpX = -dy * 0.25;
+        double perpY = dx * 0.25;
 
         _control1 = new System.Windows.Point(start.X + dx * 0.25 + perpX, start.Y + dy * 0.25 + perpY);
         _control2 = new System.Windows.Point(start.X + dx * 0.75 + perpX, start.Y + dy * 0.75 + perpY);

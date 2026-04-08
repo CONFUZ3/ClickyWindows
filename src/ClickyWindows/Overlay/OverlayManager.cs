@@ -34,18 +34,30 @@ public class OverlayManager : IDisposable
         if (_monitors.Count == 0)
         {
             Log.Warning("No monitors enumerated — using fallback primary monitor");
-            // Fallback: create a single overlay covering the primary screen
+
+            // SystemParameters returns logical (DIP) units, not physical pixels.
+            // At 125% DPI, PrimaryScreenWidth is 1536 even though the physical
+            // screen is 1920px wide. GetSystemMetrics(SM_CXSCREEN) always returns
+            // physical pixels regardless of DPI scaling.
+            int physicalWidth = NativeMethods.GetSystemMetrics(NativeMethods.SM_CXSCREEN);
+            int physicalHeight = NativeMethods.GetSystemMetrics(NativeMethods.SM_CYSCREEN);
+            double logicalWidth = SystemParameters.PrimaryScreenWidth;
+            double logicalHeight = SystemParameters.PrimaryScreenHeight;
+
+            // DpiScale = physical/logical, e.g. 1920/1536 = 1.25 at 125% DPI
+            double dpiScale = logicalWidth > 0 ? physicalWidth / logicalWidth : 1.0;
+            uint dpiValue = (uint)Math.Round(dpiScale * 96);
+
+            Log.Warning("Fallback monitor: physical={W}x{H} logical={LW}x{LH} scale={S:F2}",
+                physicalWidth, physicalHeight, logicalWidth, logicalHeight, dpiScale);
+
             _monitors.Add(new MonitorInfo
             {
-                Bounds = new Rect(0, 0,
-                    SystemParameters.PrimaryScreenWidth,
-                    SystemParameters.PrimaryScreenHeight),
-                PhysicalBounds = new System.Drawing.Rectangle(0, 0,
-                    (int)SystemParameters.PrimaryScreenWidth,
-                    (int)SystemParameters.PrimaryScreenHeight),
-                DpiScale = 1.0,
-                DpiX = 96,
-                DpiY = 96,
+                Bounds = new Rect(0, 0, logicalWidth, logicalHeight),
+                PhysicalBounds = new System.Drawing.Rectangle(0, 0, physicalWidth, physicalHeight),
+                DpiScale = dpiScale,
+                DpiX = dpiValue,
+                DpiY = dpiValue,
                 IsPrimary = true,
                 Index = 0
             });
@@ -125,8 +137,9 @@ public class OverlayManager : IDisposable
         double localX = (_cursorX - monitor.PhysicalBounds.Left) / monitor.DpiScale;
         double localY = (_cursorY - monitor.PhysicalBounds.Top) / monitor.DpiScale;
 
-        // If flight animator is active, use animated position instead
-        if (_flightAnimator?.IsFlying == true)
+        // If a flight animator exists, use its position — this keeps the triangle
+        // planted at the target after landing, not just during the flight itself
+        if (_flightAnimator != null)
         {
             var pos = _flightAnimator.CurrentPosition;
             localX = pos.X;
@@ -175,6 +188,9 @@ public class OverlayManager : IDisposable
     public void SetState(AppState state)
     {
         _state = state;
+        // Clear the flight target when going Idle so cursor tracking resumes
+        if (state == AppState.Idle)
+            _flightAnimator = null;
     }
 
     public void SetWaveformLevels(double[] levels)
@@ -201,7 +217,7 @@ public class OverlayManager : IDisposable
         _flightAnimator = new FlightPathAnimator(
             new System.Windows.Point(startLocalX, startLocalY),
             new System.Windows.Point(localX, localY),
-            duration: 0.8);
+            duration: 0.4);
         _flightAnimator.Start();
     }
 

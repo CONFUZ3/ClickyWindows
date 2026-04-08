@@ -2,6 +2,7 @@ using System.Net.WebSockets;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
+using ClickyWindows.Screen;
 using Serilog;
 
 namespace ClickyWindows.AI;
@@ -34,9 +35,14 @@ public class GeminiLiveService : IAsyncDisposable
     public bool IsConnected => _webSocket?.State == WebSocketState.Open;
 
     public Task ConnectAsync(CancellationToken token)
-        => ConnectAsync(Array.Empty<ConversationHistory.Turn>(), token);
+        => ConnectAsync(Array.Empty<ConversationHistory.Turn>(), Array.Empty<MonitorInfo>(), token);
 
-    public async Task ConnectAsync(IReadOnlyList<ConversationHistory.Turn> history, CancellationToken token)
+    public Task ConnectAsync(IReadOnlyList<ConversationHistory.Turn> history, CancellationToken token)
+        => ConnectAsync(history, Array.Empty<MonitorInfo>(), token);
+
+    public async Task ConnectAsync(IReadOnlyList<ConversationHistory.Turn> history,
+                                   IReadOnlyList<MonitorInfo> monitors,
+                                   CancellationToken token)
     {
         if (IsConnected) return;
 
@@ -60,7 +66,7 @@ public class GeminiLiveService : IAsyncDisposable
         // historyConfig.initialHistoryInClientContent, but Gemini 3.1 Flash Live closes
         // the socket with InvalidPayloadData regardless. systemInstruction is the
         // broadly-supported path for providing context to a Live session.
-        var systemInstructionText = BuildSystemInstruction(history);
+        var systemInstructionText = BuildSystemInstruction(history, monitors);
 
         var setupObj = new JsonObject
         {
@@ -174,13 +180,47 @@ public class GeminiLiveService : IAsyncDisposable
         await SendJsonAsync(msg, token);
     }
 
-    private static string BuildSystemInstruction(IReadOnlyList<ConversationHistory.Turn> history)
+    private static string BuildSystemInstruction(IReadOnlyList<ConversationHistory.Turn> history,
+                                                  IReadOnlyList<MonitorInfo> monitors)
     {
         var sb = new StringBuilder();
         sb.Append("You are Clicky, a friendly on-screen voice assistant. Keep replies short, natural, and conversational. ");
-        sb.Append("You can see the user's screen via screenshots. When pointing to something on screen, emit a tag in the form ");
-        sb.Append("[POINT:x,y:short_label:screenN] where x,y are physical pixel coordinates relative to the screenshot's monitor top-left ");
-        sb.Append("and N is the 0-based monitor index.");
+        sb.AppendLine("You can see the user's screen via screenshots.");
+        sb.AppendLine();
+
+        // Tell Gemini the exact pixel dimensions of each screenshot it will receive.
+        // Without this, Gemini guesses at the coordinate space and produces wrong coordinates.
+        if (monitors.Count > 0)
+        {
+            sb.AppendLine("SCREEN COORDINATE SPACE:");
+            for (int i = 0; i < monitors.Count; i++)
+            {
+                var m = monitors[i];
+                sb.AppendLine($"  screen{i}: {m.PhysicalBounds.Width}x{m.PhysicalBounds.Height} pixels (x: 0–{m.PhysicalBounds.Width - 1}, y: 0–{m.PhysicalBounds.Height - 1})");
+            }
+            sb.AppendLine("Only use screen0 — only the primary screen's screenshot is sent to you.");
+            sb.AppendLine();
+        }
+
+        sb.AppendLine("POINTING RULES — a visual triangle cursor will fly to any [POINT] tag you emit, so use them deliberately:");
+        sb.AppendLine();
+        sb.AppendLine("USE a [POINT] tag ONLY when one of these is true:");
+        sb.AppendLine("  1. The user asks WHERE something is (\"where is X?\", \"find X\", \"show me X\").");
+        sb.AppendLine("  2. The user asks to click, open, or navigate to a specific element.");
+        sb.AppendLine("  3. The user asks you to highlight or point at something specific.");
+        sb.AppendLine("  4. Your reply references a specific, identifiable UI element by name AND pointing it out adds clear value.");
+        sb.AppendLine();
+        sb.AppendLine("DO NOT use a [POINT] tag when:");
+        sb.AppendLine("  - The user is asking a general question or having a conversation.");
+        sb.AppendLine("  - You are describing what is on screen in general terms.");
+        sb.AppendLine("  - The user is asking about memory, history, or previous context.");
+        sb.AppendLine("  - Your reply does not reference a specific clickable or locatable UI element.");
+        sb.AppendLine("  - The answer is the whole screen or a vague area — only point if you can identify a precise spot.");
+        sb.AppendLine();
+        sb.AppendLine("When you DO point, embed exactly one tag anywhere in your response text, in this EXACT format:");
+        sb.AppendLine("  [POINT:x,y:short_label:screen0]");
+        sb.AppendLine("Example: \"The share button is right here [POINT:1456,42:Share button:screen0] in the top right.\"");
+        sb.Append("x and y must be integers within the screen0 pixel bounds listed above. The square brackets are required.");
 
         if (history.Count > 0)
         {

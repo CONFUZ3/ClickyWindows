@@ -30,8 +30,10 @@ public class PushToTalkController : IDisposable
     private string? _pendingUserTranscript;
     private string? _pendingAssistantText;
 
+    // Strip POINT tags from text before saving to history — handles both
+    // bracketed [POINT:...] and unbracketed POINT:... forms that Gemini may emit.
     private static readonly Regex PointTagRegex = new(
-        @"\[POINT:\d+,\d+:[^\]]+:screen\d+\]", RegexOptions.Compiled | RegexOptions.IgnoreCase);
+        @"\[?POINT:\d+,\d+:[^:\]\n]+:screen\d+\]?", RegexOptions.Compiled | RegexOptions.IgnoreCase);
 
     private static string HistoryPath => Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
@@ -185,15 +187,18 @@ public class PushToTalkController : IDisposable
             _pendingUserTranscript = null;
             _pendingAssistantText = null;
 
-            // History is embedded into systemInstruction inside ConnectAsync.
-            await gemini.ConnectAsync(_history.GetHistory(), token);
+            // Fetch monitors before ConnectAsync so the session's system instruction
+            // can include exact screen dimensions for accurate POINT coordinate bounds.
+            var monitors = _overlay.GetMonitors();
+
+            // History and monitor geometry are embedded into systemInstruction inside ConnectAsync.
+            await gemini.ConnectAsync(_history.GetHistory(), monitors, token);
 
             lock (_stateLock)
             {
                 if (!_isHotkeyHeld || _state != AppState.Recording || turnVersion != _turnVersion) return;
             }
 
-            var monitors = _overlay.GetMonitors();
             var captures = _screenCapture.CaptureAll(monitors);
             if (captures.Any())
             {

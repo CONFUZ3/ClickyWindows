@@ -69,8 +69,20 @@ internal static class NativeMethods
     [DllImport("shcore.dll")]
     public static extern int GetDpiForMonitor(IntPtr hmonitor, int dpiType, out uint dpiX, out uint dpiY);
 
-    [DllImport("user32.dll")]
+    // CharSet.Auto is required so P/Invoke calls GetMonitorInfoW (Unicode).
+    // Without it the default is CharSet.Ansi, which calls GetMonitorInfoA and expects
+    // a cbSize of 72 (ANSI struct). Our MONITORINFOEX uses CharSet.Auto so Marshal.SizeOf
+    // returns 104 (Unicode struct) — the mismatch causes GetMonitorInfoA to return false.
+    [DllImport("user32.dll", CharSet = CharSet.Auto)]
     public static extern bool GetMonitorInfo(IntPtr hMonitor, ref MONITORINFOEX lpmi);
+
+    // Returns physical pixel dimensions of the primary screen, unlike
+    // SystemParameters which returns logical/DIP units at high DPI.
+    public const int SM_CXSCREEN = 0;
+    public const int SM_CYSCREEN = 1;
+
+    [DllImport("user32.dll")]
+    public static extern int GetSystemMetrics(int nIndex);
 
     [DllImport("user32.dll")]
     public static extern IntPtr MonitorFromPoint(POINT pt, uint dwFlags);

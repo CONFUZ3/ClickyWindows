@@ -12,9 +12,10 @@ public record PointTarget(int X, int Y, string Label, int ScreenIndex);
 /// </summary>
 public static class PointParser
 {
-    // [POINT:x,y:label:screenN]
+    // Matches [POINT:x,y:label:screenN] with or without surrounding brackets.
+    // Gemini occasionally emits the tag without brackets, so we accept both forms.
     private static readonly Regex PointRegex = new(
-        @"\[POINT:(\d+),(\d+):([^:\]]+):screen(\d+)\]",
+        @"\[?POINT:(\d+),(\d+):([^:\]\n]+):screen(\d+)\]?",
         RegexOptions.Compiled | RegexOptions.IgnoreCase);
 
     public static List<PointTarget> ParseAll(string text, IReadOnlyList<MonitorInfo> monitors)

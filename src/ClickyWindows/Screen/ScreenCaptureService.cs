@@ -1,5 +1,4 @@
 using System.Drawing;
-using System.Drawing.Drawing2D;
 using System.Drawing.Imaging;
 using System.IO;
 using Serilog;
@@ -9,12 +8,12 @@ namespace ClickyWindows.Screen;
 public record ScreenCapture(string Base64Jpeg, int Width, int Height, int MonitorIndex, bool IsFocus);
 
 /// <summary>
-/// Captures screens using Graphics.CopyFromScreen (adequate for single-frame capture per plan).
-/// Resizes to max 1280px wide, JPEG 80% quality.
+/// Captures screens using Graphics.CopyFromScreen at full physical resolution.
+/// Sends JPEG at 80% quality — full resolution is required so Gemini's coordinate estimates
+/// map directly to physical screen pixels without any scaling correction.
 /// </summary>
 public class ScreenCaptureService
 {
-    private const int MaxWidth = 1280;
     private const int JpegQuality = 80;
 
     public List<ScreenCapture> CaptureAll(IReadOnlyList<MonitorInfo> monitors)
@@ -51,30 +50,11 @@ public class ScreenCaptureService
             new Size(physBounds.Width, physBounds.Height),
             CopyPixelOperation.SourceCopy);
 
-        // Resize to max 1280px wide
-        var (resized, finalW, finalH) = ResizeIfNeeded(bitmap);
-        using (resized)
-        {
-            var base64 = EncodeJpeg(resized);
-            return new ScreenCapture(base64, finalW, finalH, monitor.Index, monitor.IsPrimary);
-        }
-    }
-
-    private (Bitmap bitmap, int width, int height) ResizeIfNeeded(Bitmap source)
-    {
-        if (source.Width <= MaxWidth)
-            return (source, source.Width, source.Height);
-
-        double scale = (double)MaxWidth / source.Width;
-        int newW = MaxWidth;
-        int newH = (int)(source.Height * scale);
-
-        var resized = new Bitmap(newW, newH, PixelFormat.Format32bppArgb);
-        using var g = Graphics.FromImage(resized);
-        g.InterpolationMode = InterpolationMode.HighQualityBicubic;
-        g.DrawImage(source, 0, 0, newW, newH);
-
-        return (resized, newW, newH);
+        // Send at full physical resolution so Gemini's coordinate estimates match the screen exactly.
+        // Resizing to a smaller image causes Gemini to report coordinates in an ambiguous pixel space,
+        // making it impossible to accurately map them back to physical screen coordinates.
+        var base64 = EncodeJpeg(bitmap);
+        return new ScreenCapture(base64, physBounds.Width, physBounds.Height, monitor.Index, monitor.IsPrimary);
     }
 
     private static string EncodeJpeg(Bitmap bitmap)
