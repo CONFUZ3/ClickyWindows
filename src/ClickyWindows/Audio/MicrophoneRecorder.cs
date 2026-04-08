@@ -62,8 +62,12 @@ public class MicrophoneRecorder : IDisposable
         else
             Log.Debug("Microphone recording stopped");
 
-        _waveIn?.Dispose();
-        _waveIn = null;
+        if (sender is WaveInEvent stopped)
+        {
+            stopped.Dispose();
+            if (ReferenceEquals(_waveIn, stopped))
+                _waveIn = null;
+        }
     }
 
     public void Dispose()

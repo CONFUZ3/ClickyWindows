@@ -61,22 +61,29 @@ public class GlobalHotkeyService
     /// <summary>Must be called from the UI thread (message pump required for WH_KEYBOARD_LL).</summary>
     private void RegisterHook()
     {
-        UnregisterHook(); // clean up any previous hook
+        try
+        {
+            UnregisterHook(); // clean up any previous hook
 
-        // Keep a GC-rooted reference to the delegate
-        _hookProc = LowLevelKeyboardProc;
-        using var process = Process.GetCurrentProcess();
-        using var module = process.MainModule!;
-        _hookHandle = NativeMethods.SetWindowsHookEx(
-            NativeMethods.WH_KEYBOARD_LL,
-            _hookProc,
-            NativeMethods.GetModuleHandle(module.ModuleName),
-            0);
+            // Keep a GC-rooted reference to the delegate
+            _hookProc = LowLevelKeyboardProc;
+            using var process = Process.GetCurrentProcess();
+            using var module = process.MainModule!;
+            _hookHandle = NativeMethods.SetWindowsHookEx(
+                NativeMethods.WH_KEYBOARD_LL,
+                _hookProc,
+                NativeMethods.GetModuleHandle(module.ModuleName),
+                0);
 
-        if (_hookHandle == IntPtr.Zero)
-            Log.Error("Failed to register keyboard hook (error: {Error})", Marshal.GetLastWin32Error());
-        else
-            Log.Information("Keyboard hook registered (attempt #{Count})", _reRegisterCount + 1);
+            if (_hookHandle == IntPtr.Zero)
+                Log.Error("Failed to register keyboard hook (error: {Error})", Marshal.GetLastWin32Error());
+            else
+                Log.Information("Keyboard hook registered (attempt #{Count})", _reRegisterCount + 1);
+        }
+        catch (Exception ex)
+        {
+            Log.Error(ex, "Exception while registering keyboard hook");
+        }
     }
 
     private void UnregisterHook()
@@ -129,26 +136,37 @@ public class GlobalHotkeyService
 
         while (_cts?.IsCancellationRequested == false)
         {
-            bool isActive = _ctrlDown && _altDown;
+            try
+            {
+                bool isActive = _ctrlDown && _altDown;
 
-            if (isActive && !wasActive)
-            {
-                wasActive = true;
-                HotkeyPressed?.Invoke();
-                Log.Debug("Hotkey pressed (Ctrl+Alt)");
+                if (isActive && !wasActive)
+                {
+                    wasActive = true;
+                    HotkeyPressed?.Invoke();
+                    Log.Debug("Hotkey pressed (Ctrl+Alt)");
+                }
+                else if (!isActive && wasActive)
+                {
+                    wasActive = false;
+                    HotkeyReleased?.Invoke();
+                    Log.Debug("Hotkey released (Ctrl+Alt)");
+                }
+
+                // Periodic hook health check — only after we've confirmed the hook worked at least once
+                iteration++;
+                if (iteration % HealthCheckIntervalIterations == 0 && _everReceivedCallback)
+                {
+                    CheckHookHealth();
+                }
             }
-            else if (!isActive && wasActive)
+            catch (Exception ex)
             {
+                Log.Error(ex, "Unhandled exception in hotkey processing loop");
+                // Reset inferred key state after faults to avoid phantom press state.
                 wasActive = false;
-                HotkeyReleased?.Invoke();
-                Log.Debug("Hotkey released (Ctrl+Alt)");
-            }
-
-            // Periodic hook health check — only after we've confirmed the hook worked at least once
-            iteration++;
-            if (iteration % HealthCheckIntervalIterations == 0 && _everReceivedCallback)
-            {
-                CheckHookHealth();
+                _altDown = false;
+                _ctrlDown = false;
             }
 
             Thread.Sleep(10); // 10ms polling is fine for key state
@@ -172,8 +190,15 @@ public class GlobalHotkeyService
             _altDown = false;
             _ctrlDown = false;
 
-            // WH_KEYBOARD_LL requires a message pump — must re-register on the UI thread
-            System.Windows.Application.Current?.Dispatcher.BeginInvoke(RegisterHook);
+            // WH_KEYBOARD_LL requires a message pump — must re-register on the UI thread.
+            try
+            {
+                System.Windows.Application.Current?.Dispatcher.BeginInvoke(RegisterHook);
+            }
+            catch (Exception ex)
+            {
+                Log.Error(ex, "Failed to schedule keyboard hook re-registration on UI thread");
+            }
         }
     }
 }

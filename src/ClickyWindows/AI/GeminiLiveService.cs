@@ -18,10 +18,12 @@ public class GeminiLiveService : IAsyncDisposable
     public event Action<byte[]>? AudioReceived;
     public event Action<string>? TextChunkReceived;
     public event Action<string>? TextCompleted;
+    public event Action<string>? InputTranscriptionReceived;
     public event Action<Exception>? ErrorOccurred;
     public event Action? TurnComplete;
 
     private readonly StringBuilder _textBuffer = new();
+    private readonly SemaphoreSlim _sendLock = new(1, 1);
 
     public GeminiLiveService(string apiKey, GeminiSettings settings)
     {
@@ -31,7 +33,10 @@ public class GeminiLiveService : IAsyncDisposable
 
     public bool IsConnected => _webSocket?.State == WebSocketState.Open;
 
-    public async Task ConnectAsync(CancellationToken token)
+    public Task ConnectAsync(CancellationToken token)
+        => ConnectAsync(Array.Empty<ConversationHistory.Turn>(), token);
+
+    public async Task ConnectAsync(IReadOnlyList<ConversationHistory.Turn> history, CancellationToken token)
     {
         if (IsConnected) return;
 
@@ -43,37 +48,55 @@ public class GeminiLiveService : IAsyncDisposable
         }
         _connectionCts = CancellationTokenSource.CreateLinkedTokenSource(token);
         _webSocket = new ClientWebSocket();
-        
-        var uri = new Uri($"wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateContent?key={_apiKey}");
-        
+
+        var uri = new Uri($"wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key={_apiKey}");
+
         Log.Information("Connecting to Gemini Live API...");
         await _webSocket.ConnectAsync(uri, _connectionCts.Token);
         Log.Information("Connected to Gemini Live API network transport");
         _setupCompleteTcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
 
-        var setupMsg = new
+        // Embed prior conversation as a system instruction. We tried clientContent with
+        // historyConfig.initialHistoryInClientContent, but Gemini 3.1 Flash Live closes
+        // the socket with InvalidPayloadData regardless. systemInstruction is the
+        // broadly-supported path for providing context to a Live session.
+        var systemInstructionText = BuildSystemInstruction(history);
+
+        var setupObj = new JsonObject
         {
-            setup = new
+            ["model"] = _settings.Model,
+            ["generationConfig"] = new JsonObject
             {
-                model = _settings.Model,
-                generationConfig = new
+                ["responseModalities"] = new JsonArray { "AUDIO" },
+                ["speechConfig"] = new JsonObject
                 {
-                    responseModalities = new[] { "AUDIO" },
-                    speechConfig = new
+                    ["voiceConfig"] = new JsonObject
                     {
-                        voiceConfig = new
-                        {
-                            prebuiltVoiceConfig = new
-                            {
-                                voiceName = _settings.VoiceName
-                            }
-                        }
+                        ["prebuiltVoiceConfig"] = new JsonObject { ["voiceName"] = _settings.VoiceName }
                     }
                 }
-            }
+            },
+            ["inputAudioTranscription"] = new JsonObject(),
+            ["outputAudioTranscription"] = new JsonObject()
         };
 
-        await SendJsonAsync(setupMsg, _connectionCts.Token);
+        if (!string.IsNullOrEmpty(systemInstructionText))
+        {
+            setupObj["systemInstruction"] = new JsonObject
+            {
+                ["parts"] = new JsonArray { new JsonObject { ["text"] = systemInstructionText } }
+            };
+        }
+
+        var setupMsg = new JsonObject { ["setup"] = setupObj };
+        var setupJson = setupMsg.ToJsonString();
+        await _sendLock.WaitAsync(_connectionCts.Token);
+        try
+        {
+            var bytes = Encoding.UTF8.GetBytes(setupJson);
+            await _webSocket.SendAsync(new ArraySegment<byte>(bytes), WebSocketMessageType.Text, true, _connectionCts.Token);
+        }
+        finally { _sendLock.Release(); }
 
         _receiveTask = Task.Run(() => ReceiveLoopAsync(_connectionCts.Token), _connectionCts.Token);
         
@@ -151,13 +174,43 @@ public class GeminiLiveService : IAsyncDisposable
         await SendJsonAsync(msg, token);
     }
 
+    private static string BuildSystemInstruction(IReadOnlyList<ConversationHistory.Turn> history)
+    {
+        var sb = new StringBuilder();
+        sb.Append("You are Clicky, a friendly on-screen voice assistant. Keep replies short, natural, and conversational. ");
+        sb.Append("You can see the user's screen via screenshots. When pointing to something on screen, emit a tag in the form ");
+        sb.Append("[POINT:x,y:short_label:screenN] where x,y are physical pixel coordinates relative to the screenshot's monitor top-left ");
+        sb.Append("and N is the 0-based monitor index.");
+
+        if (history.Count > 0)
+        {
+            sb.AppendLine();
+            sb.AppendLine();
+            sb.AppendLine("Earlier in this conversation (most recent last):");
+            foreach (var t in history)
+            {
+                var speaker = t.Role == "user" ? "User" : "Assistant";
+                sb.Append(speaker).Append(": ").AppendLine(t.Content);
+            }
+            sb.AppendLine();
+            sb.Append("Continue the conversation naturally from here. The user's next message follows.");
+        }
+
+        return sb.ToString();
+    }
+
     private async Task SendJsonAsync(object payload, CancellationToken token)
     {
         if (!IsConnected) return;
-        
-        var json = JsonSerializer.Serialize(payload);
-        var bytes = Encoding.UTF8.GetBytes(json);
-        await _webSocket!.SendAsync(new ArraySegment<byte>(bytes), WebSocketMessageType.Text, true, token);
+        await _sendLock.WaitAsync(token);
+        try
+        {
+            if (!IsConnected) return;
+            var json = JsonSerializer.Serialize(payload);
+            var bytes = Encoding.UTF8.GetBytes(json);
+            await _webSocket!.SendAsync(new ArraySegment<byte>(bytes), WebSocketMessageType.Text, true, token);
+        }
+        finally { _sendLock.Release(); }
     }
 
     private async Task ReceiveLoopAsync(CancellationToken token)
@@ -229,6 +282,22 @@ public class GeminiLiveService : IAsyncDisposable
                     return; // Ignore
                 }
 
+                var inputTx = serverContent["inputTranscription"];
+                if (inputTx != null)
+                {
+                    var txText = inputTx["text"]?.GetValue<string>();
+                    if (!string.IsNullOrWhiteSpace(txText))
+                        InputTranscriptionReceived?.Invoke(txText);
+                }
+
+                var outputTx = serverContent["outputTranscription"];
+                if (outputTx != null)
+                {
+                    var txText = outputTx["text"]?.GetValue<string>();
+                    if (!string.IsNullOrWhiteSpace(txText))
+                        _textBuffer.Append(txText);
+                }
+
                 var modelTurn = serverContent["modelTurn"];
                 if (modelTurn != null)
                 {
@@ -237,7 +306,7 @@ public class GeminiLiveService : IAsyncDisposable
                     {
                         foreach (var part in parts)
                         {
-                            var textNode = part["text"];
+                            var textNode = part?["text"];
                             if (textNode != null)
                             {
                                 var text = textNode.GetValue<string>();
@@ -294,7 +363,8 @@ public class GeminiLiveService : IAsyncDisposable
             {
                 try
                 {
-                    await _webSocket.CloseAsync(WebSocketCloseStatus.NormalClosure, "Disposing", CancellationToken.None);
+                    using var closeCts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+                    await _webSocket.CloseAsync(WebSocketCloseStatus.NormalClosure, "Disposing", closeCts.Token);
                 }
                 catch { }
             }

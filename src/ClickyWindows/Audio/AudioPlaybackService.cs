@@ -125,18 +125,24 @@ public class AudioPlaybackService : IDisposable
     {
         _drainCts?.Cancel();
         _drainCts = null;
-        _wasapiOut?.Stop();
-        _wasapiOut?.Dispose();
+        // Null the field BEFORE stopping so OnPlaybackStopped's reference check
+        // fails for this instance and PlaybackCompleted is not raised spuriously.
+        var wasapi = _wasapiOut;
         _wasapiOut = null;
         _buffer = null;
         _playbackStarted = false;
+        wasapi?.Stop();
+        wasapi?.Dispose();
     }
 
     private void OnPlaybackStopped(object? sender, StoppedEventArgs e)
     {
         if (e.Exception != null)
             Log.Error(e.Exception, "Playback stopped with error");
-        PlaybackCompleted?.Invoke();
+        // Only raise PlaybackCompleted for the currently active WasapiOut instance.
+        // Stale events from a disposed instance (or a manually stopped one) are ignored.
+        if (ReferenceEquals(sender, _wasapiOut))
+            PlaybackCompleted?.Invoke();
     }
 
     public void Dispose() => Stop();
