@@ -23,7 +23,8 @@ public class GeminiLiveService : IAsyncDisposable
     public event Action<Exception>? ErrorOccurred;
     public event Action? TurnComplete;
 
-    private readonly StringBuilder _textBuffer = new();
+    private readonly StringBuilder _modelTextBuffer = new();
+    private readonly StringBuilder _outputTranscriptBuffer = new();
     private readonly SemaphoreSlim _sendLock = new(1, 1);
 
     public GeminiLiveService(string apiKey, GeminiSettings settings)
@@ -81,6 +82,7 @@ public class GeminiLiveService : IAsyncDisposable
             ["generationConfig"] = new JsonObject
             {
                 ["responseModalities"] = new JsonArray { "AUDIO" },
+                ["temperature"] = _settings.Temperature,
                 ["speechConfig"] = new JsonObject
                 {
                     ["voiceConfig"] = new JsonObject
@@ -193,29 +195,55 @@ public class GeminiLiveService : IAsyncDisposable
     {
         var sb = new StringBuilder();
         sb.AppendLine("You are Clicky, a voice assistant that helps users navigate and understand their screen.");
-        sb.AppendLine("You receive a screenshot of the user's screen at the start of each turn.");
+        sb.AppendLine("You receive exactly one screenshot at the start of each turn.");
+        sb.AppendLine("Treat that screenshot as the only visual source of truth for this turn.");
         sb.AppendLine();
-        sb.AppendLine("RULES FOR SCREEN QUESTIONS:");
-        sb.AppendLine("- Base every answer about the screen ONLY on what you can literally see in the screenshot.");
-        sb.AppendLine("- Do NOT use your general knowledge of what an app usually looks like to fill in gaps.");
-        sb.AppendLine("- Do NOT describe, infer, or mention UI elements, text, or content that is not visible.");
-        sb.AppendLine("- If the user asks about something you cannot see, say so clearly: \"I don't see that on your screen.\"");
-        sb.AppendLine("- If the screenshot is unclear or the element is hard to read, say so rather than guessing.");
+        sb.AppendLine("VISIBLE FRAME FOR THIS TURN:");
+        if (monitors.Count > 0)
+        {
+            var primaryMonitor = monitors.FirstOrDefault(m => m.IsPrimary) ?? monitors[0];
+            var physicalBounds = primaryMonitor.PhysicalBounds;
+            var (scaledWidth, scaledHeight) = ScreenCaptureService.GetScaledDimensions(
+                physicalBounds.Width, physicalBounds.Height);
+            sb.AppendLine($"- You can see only monitor screen{primaryMonitor.Index} (the primary display).");
+            sb.AppendLine($"- Screenshot pixel size: {scaledWidth}x{scaledHeight}.");
+            sb.AppendLine($"- Original monitor physical size: {physicalBounds.Width}x{physicalBounds.Height}.");
+            if (monitors.Count > 1)
+            {
+                sb.AppendLine("- Other monitors are NOT visible in this turn's screenshot.");
+            }
+        }
+        else
+        {
+            sb.AppendLine("- Monitor metadata is unavailable. Use only visible pixels in the screenshot.");
+        }
         sb.AppendLine();
-        sb.Append("Keep replies short, natural, and conversational.");
+        sb.AppendLine("CRITICAL RULES TO PREVENT HALLUCINATIONS (STRICT COMPLIANCE REQUIRED):");
+        sb.AppendLine("1. VISUAL GROUNDING: Base EVERY answer EXCLUSIVELY on the literal pixels visible in the provided screenshot.");
+        sb.AppendLine("2. NO ASSUMPTIONS: NEVER guess, infer, or use outside knowledge about how applications typically look or behave.");
+        sb.AppendLine("3. NO PHANTOM UI: NEVER mention buttons, menus, text, or features that are not explicitly drawn on the screen right now.");
+        sb.AppendLine("4. EXACT TEXT ONLY: When reading text from the screen, read it EXACTLY as written. Do not paraphrase or invent text.");
+        sb.AppendLine("5. MISSING ELEMENTS: If asked about something not currently visible, you MUST reply: \"I don't see that on your screen right now.\"");
+        sb.AppendLine("6. AMBIGUITY: If an element is blurry, cut off, or ambiguous, state that you cannot see it clearly instead of guessing.");
+        sb.AppendLine();
+        sb.AppendLine("CONVERSATION STYLE:");
+        sb.AppendLine("- Keep replies extremely short, direct, and conversational.");
+        sb.AppendLine("- DO NOT use filler phrases like \"Based on the screenshot\" or \"I can see\". Just answer the question.");
+        sb.AppendLine("- If history conflicts with current pixels, trust current pixels.");
 
         if (history.Count > 0)
         {
             sb.AppendLine();
             sb.AppendLine();
             sb.AppendLine("Earlier in this conversation (most recent last):");
+            sb.AppendLine("Use this history only for conversational continuity, not as evidence about the current screen.");
             foreach (var t in history)
             {
                 var speaker = t.Role == "user" ? "User" : "Assistant";
                 sb.Append(speaker).Append(": ").AppendLine(t.Content);
             }
             sb.AppendLine();
-            sb.Append("Continue the conversation naturally from here. The user's next message follows.");
+            sb.Append("The user's next message follows.");
         }
 
         return sb.ToString();
@@ -303,7 +331,8 @@ public class GeminiLiveService : IAsyncDisposable
                 var interrupted = serverContent["interrupted"]?.GetValue<bool>() ?? false;
                 if (interrupted)
                 {
-                    _textBuffer.Clear();
+                    _modelTextBuffer.Clear();
+                    _outputTranscriptBuffer.Clear();
                     return; // Ignore
                 }
 
@@ -320,7 +349,7 @@ public class GeminiLiveService : IAsyncDisposable
                 {
                     var txText = outputTx["text"]?.GetValue<string>();
                     if (!string.IsNullOrWhiteSpace(txText))
-                        _textBuffer.Append(txText);
+                        _outputTranscriptBuffer.Append(txText);
                 }
 
                 var modelTurn = serverContent["modelTurn"];
@@ -331,11 +360,13 @@ public class GeminiLiveService : IAsyncDisposable
                     {
                         foreach (var part in parts)
                         {
-                            var textNode = part?["text"];
+                            if (part == null) continue;
+
+                            var textNode = part["text"];
                             if (textNode != null)
                             {
                                 var text = textNode.GetValue<string>();
-                                _textBuffer.Append(text);
+                                _modelTextBuffer.Append(text);
                                 TextChunkReceived?.Invoke(text);
                             }
 
@@ -357,8 +388,11 @@ public class GeminiLiveService : IAsyncDisposable
                 var turnComplete = serverContent["turnComplete"]?.GetValue<bool>() ?? false;
                 if (turnComplete)
                 {
-                    var fullText = _textBuffer.ToString();
-                    _textBuffer.Clear();
+                    var modelText = _modelTextBuffer.ToString();
+                    var transcriptText = _outputTranscriptBuffer.ToString();
+                    var fullText = !string.IsNullOrWhiteSpace(modelText) ? modelText : transcriptText;
+                    _modelTextBuffer.Clear();
+                    _outputTranscriptBuffer.Clear();
                     if (!string.IsNullOrWhiteSpace(fullText))
                     {
                         TextCompleted?.Invoke(fullText);

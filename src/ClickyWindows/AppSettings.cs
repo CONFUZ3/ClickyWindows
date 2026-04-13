@@ -26,4 +26,7 @@ public class GeminiSettings
     public string VoiceName { get; set; } = "Aoede";
     public int ConnectTimeoutMs { get; set; } = 5000;
     public string PointingModel { get; set; } = "models/gemini-pro-latest";
+    public int HistoryTurns { get; set; } = 6;
+    public bool RequireScreenshotBeforeAudio { get; set; } = true;
+    public double Temperature { get; set; } = 0.1;
 }

@@ -25,6 +25,7 @@ public class PushToTalkController : IDisposable
     private readonly ScreenCaptureService _screenCapture;
     private readonly string? _geminiApiKey;
     private readonly Queue<byte[]> _audioBuffer = new();
+    private volatile bool _canStreamAudioToGemini;
 
     // Saved at screenshot-capture time so OnGeminiInputTranscription can pass them to the Flash pointing call.
     private List<ScreenCapture> _lastScreenCaptures = new();
@@ -61,7 +62,7 @@ public class PushToTalkController : IDisposable
         _screenCapture = new ScreenCaptureService();
 
         _geminiApiKey = CredentialStore.GetKey(CredentialStore.GeminiTarget);
-        _history = ConversationHistory.Load(HistoryPath);
+        _history = ConversationHistory.Load(HistoryPath, settings.Gemini.HistoryTurns);
 
         if (!string.IsNullOrEmpty(_geminiApiKey))
             _flashPointing = new GeminiFlashPointingService(_geminiApiKey, settings.Gemini.PointingModel);
@@ -193,6 +194,7 @@ public class PushToTalkController : IDisposable
             _pendingScreenshot = null;
             _pendingUserTranscript = null;
             _pendingAssistantText = null;
+            _canStreamAudioToGemini = !_settings.Gemini.RequireScreenshotBeforeAudio;
 
             // Fetch monitors before ConnectAsync so the session's system instruction
             // can include exact screen dimensions for accurate POINT coordinate bounds.
@@ -216,6 +218,14 @@ public class PushToTalkController : IDisposable
                 var focusedCapture = captures.FirstOrDefault(c => c.IsFocus) ?? captures.First();
                 _pendingScreenshot = focusedCapture.Base64Jpeg;
                 await gemini.SendScreenshotAsync(_pendingScreenshot, token);
+                _canStreamAudioToGemini = true;
+                await FlushBufferedAudioAsync(gemini, token);
+            }
+            else if (_settings.Gemini.RequireScreenshotBeforeAudio)
+            {
+                // If capture fails, avoid deadlocking turn audio and continue with audio-only.
+                _canStreamAudioToGemini = true;
+                await FlushBufferedAudioAsync(gemini, token);
             }
         }
         catch (OperationCanceledException)
@@ -238,7 +248,11 @@ public class PushToTalkController : IDisposable
             var gemini = _gemini;
             var cts = _interactionCts;
 
-            if (gemini == null || _state != AppState.Recording) return;
+            if (gemini == null) return;
+            lock (_stateLock)
+            {
+                if (_state != AppState.Recording) return;
+            }
 
             var copy = new byte[count];
             Buffer.BlockCopy(buffer, 0, copy, 0, count);
@@ -247,25 +261,14 @@ public class PushToTalkController : IDisposable
             try { token = cts?.Token ?? CancellationToken.None; }
             catch (ObjectDisposedException) { return; }
 
-            if (!gemini.IsConnected)
+            if (!gemini.IsConnected || !_canStreamAudioToGemini)
             {
                 lock (_audioBuffer) { _audioBuffer.Enqueue(copy); }
             }
             else
             {
-                // Flush any audio buffered before the WebSocket was ready.
-                while (true)
-                {
-                    byte[]? queued = null;
-                    lock (_audioBuffer)
-                    {
-                        if (_audioBuffer.Count > 0)
-                            queued = _audioBuffer.Dequeue();
-                    }
-                    if (queued == null) break;
-                    await gemini.SendAudioAsync(queued, token);
-                }
-
+                // Flush any audio buffered before the WebSocket and screenshot were ready.
+                await FlushBufferedAudioAsync(gemini, token);
                 await gemini.SendAudioAsync(copy, token);
             }
         }
@@ -356,8 +359,8 @@ public class PushToTalkController : IDisposable
 
     private void OnGeminiInputTranscription(string transcript)
     {
-        _pendingUserTranscript = transcript;
-        Log.Information("User transcript: {Text}", transcript);
+        _pendingUserTranscript = SelectBestTranscript(_pendingUserTranscript, transcript);
+        Log.Information("User transcript: {Text}", _pendingUserTranscript ?? transcript);
 
         // Fire the Flash pointing call immediately in parallel with Live's audio response.
         // We capture turnVersion and captures by value so a concurrent new turn can't affect this call.
@@ -454,7 +457,7 @@ public class PushToTalkController : IDisposable
 
         if (_pendingAssistantText != null)
         {
-            var userText = _pendingUserTranscript ?? "(voice)";
+            var userText = _pendingUserTranscript ?? "User spoke (transcript unavailable).";
             _history.AddUserMessage(userText, _pendingScreenshot);
             _history.AddAssistantMessage(_pendingAssistantText);
             _history.Save(HistoryPath);
@@ -505,10 +508,12 @@ public class PushToTalkController : IDisposable
             _gemini = null;
             // _isHotkeyHeld is physical key state — never cleared here
         }
+        _canStreamAudioToGemini = false;
 
         // Cleanup OUTSIDE lock to prevent deadlock with playback callbacks.
         _recorder.DataAvailable -= OnAudioData;
         _recorder.StopRecording();
+        lock (_audioBuffer) { _audioBuffer.Clear(); }
         oldCts?.Cancel();
         oldCts?.Dispose();
         _playback.Stop();
@@ -547,6 +552,41 @@ public class PushToTalkController : IDisposable
         try { DetachGeminiHandlers(gemini); }
         catch (Exception ex) { Log.Warning(ex, "Failed to detach Gemini event handlers cleanly"); }
         _geminiDisposalTask = gemini.DisposeAsync().AsTask();
+    }
+
+    private async Task FlushBufferedAudioAsync(GeminiLiveService gemini, CancellationToken token)
+    {
+        while (true)
+        {
+            byte[]? queued = null;
+            lock (_audioBuffer)
+            {
+                if (_audioBuffer.Count > 0)
+                    queued = _audioBuffer.Dequeue();
+            }
+
+            if (queued == null) break;
+            await gemini.SendAudioAsync(queued, token);
+        }
+    }
+
+    private static string? SelectBestTranscript(string? existingTranscript, string incomingTranscript)
+    {
+        if (string.IsNullOrWhiteSpace(incomingTranscript))
+            return existingTranscript;
+
+        var trimmedIncoming = incomingTranscript.Trim();
+        if (string.IsNullOrWhiteSpace(existingTranscript))
+            return trimmedIncoming;
+
+        var trimmedExisting = existingTranscript.Trim();
+        if (trimmedIncoming.Length >= trimmedExisting.Length ||
+            trimmedIncoming.StartsWith(trimmedExisting, StringComparison.OrdinalIgnoreCase))
+        {
+            return trimmedIncoming;
+        }
+
+        return trimmedExisting;
     }
 
     public void Dispose()
