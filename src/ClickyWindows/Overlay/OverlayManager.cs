@@ -21,8 +21,31 @@ public class OverlayManager : IDisposable
     private AppState _state = AppState.Idle;
     private double _cursorX, _cursorY; // physical cursor coords
 
-    // Animation state
+    // --- Animation state ---
+
     private FlightPathAnimator? _flightAnimator;
+    private FlightPhase _flightPhase = FlightPhase.None;
+
+    // Position where the outbound flight landed — held during Speaking / hold phase.
+    private System.Windows.Point _holdPosition;
+
+    // Accumulates time at the target before triggering a return flight.
+    private double _holdElapsed;
+
+    // Cursor position when return flight began, in overlay-local logical coords.
+    // Used to detect large mouse movements that should cancel the return early.
+    private System.Windows.Point _returnStartCursorLocal;
+
+    // How long (seconds) to hold at the target before flying back.
+    private const double HoldDurationSeconds = 3.0;
+
+    // Duration of the return flight to the cursor.
+    private const double ReturnFlightDurationSeconds = 0.4;
+
+    // If the mouse moves more than this many logical pixels during the return flight,
+    // cancel the animation early and snap to cursor — the user has moved on.
+    private const double MouseCancelThresholdLogical = 100.0;
+
     private double[] _waveformLevels = new double[5];
     private string _speechBubbleText = "";
     private bool _showSpeechBubble;
@@ -88,7 +111,7 @@ public class OverlayManager : IDisposable
         _stopwatch.Restart();
 
         UpdateCursorPosition();
-        UpdateAnimation(elapsed);
+        UpdateFlightLifecycle(elapsed);
         RenderToOverlays();
     }
 
@@ -121,10 +144,92 @@ public class OverlayManager : IDisposable
         return _monitors.Count > 0 ? _monitors[0] : null;
     }
 
-    private void UpdateAnimation(double deltaSeconds)
+    private void UpdateFlightLifecycle(double deltaSeconds)
     {
-        if (_flightAnimator?.IsFlying == true)
-            _flightAnimator.Update(deltaSeconds);
+        switch (_flightPhase)
+        {
+            case FlightPhase.FlyingToTarget:
+                _flightAnimator!.Update(deltaSeconds);
+                if (!_flightAnimator.IsFlying)
+                {
+                    // Outbound flight landed. Save position and start holding.
+                    _holdPosition = _flightAnimator.EndPosition;
+                    _holdElapsed = 0;
+                    _flightPhase = FlightPhase.HoldingAtTarget;
+                    Log.Debug("Flight landed at ({X:F1},{Y:F1}), holding", _holdPosition.X, _holdPosition.Y);
+                }
+                break;
+
+            case FlightPhase.HoldingAtTarget:
+                // Only count down the hold timer once we're back in Idle (Speaking has ended).
+                // While the AI is still speaking, the triangle stays planted at the target indefinitely.
+                if (_state == AppState.Idle)
+                {
+                    _holdElapsed += deltaSeconds;
+                    if (_holdElapsed >= HoldDurationSeconds)
+                        StartReturnFlight();
+                }
+                break;
+
+            case FlightPhase.ReturningToCursor:
+                _flightAnimator!.Update(deltaSeconds);
+
+                // Cancel the return early if the user has moved the mouse significantly —
+                // they've moved on and the triangle should just follow the cursor again.
+                var monitor = _activeOverlay?.Monitor ?? (_monitors.Count > 0 ? _monitors[0] : null);
+                if (monitor != null)
+                {
+                    double currentLocalX = (_cursorX - monitor.PhysicalBounds.Left) / monitor.DpiScale;
+                    double currentLocalY = (_cursorY - monitor.PhysicalBounds.Top) / monitor.DpiScale;
+                    double dx = currentLocalX - _returnStartCursorLocal.X;
+                    double dy = currentLocalY - _returnStartCursorLocal.Y;
+                    double distanceMoved = Math.Sqrt(dx * dx + dy * dy);
+                    if (distanceMoved > MouseCancelThresholdLogical)
+                    {
+                        Log.Debug("Return flight cancelled — mouse moved {D:F0}px", distanceMoved);
+                        ClearFlightAnimator();
+                        break;
+                    }
+                }
+
+                if (!_flightAnimator.IsFlying)
+                {
+                    Log.Debug("Return flight complete, resuming cursor following");
+                    ClearFlightAnimator();
+                }
+                break;
+        }
+    }
+
+    private void StartReturnFlight()
+    {
+        // Build the return flight from the held position back to the current cursor position.
+        var monitor = _activeOverlay?.Monitor ?? (_monitors.Count > 0 ? _monitors[0] : null);
+        if (monitor == null)
+        {
+            ClearFlightAnimator();
+            return;
+        }
+
+        double cursorLocalX = (_cursorX - monitor.PhysicalBounds.Left) / monitor.DpiScale;
+        double cursorLocalY = (_cursorY - monitor.PhysicalBounds.Top) / monitor.DpiScale;
+        _returnStartCursorLocal = new System.Windows.Point(cursorLocalX, cursorLocalY);
+
+        _flightAnimator = new FlightPathAnimator(
+            _holdPosition,
+            new System.Windows.Point(cursorLocalX, cursorLocalY),
+            ReturnFlightDurationSeconds);
+        _flightAnimator.Start();
+        _flightPhase = FlightPhase.ReturningToCursor;
+
+        Log.Debug("Return flight starting from ({HX:F1},{HY:F1}) to cursor ({CX:F1},{CY:F1})",
+            _holdPosition.X, _holdPosition.Y, cursorLocalX, cursorLocalY);
+    }
+
+    private void ClearFlightAnimator()
+    {
+        _flightAnimator = null;
+        _flightPhase = FlightPhase.None;
     }
 
     private void RenderToOverlays()
@@ -137,13 +242,22 @@ public class OverlayManager : IDisposable
         double localX = (_cursorX - monitor.PhysicalBounds.Left) / monitor.DpiScale;
         double localY = (_cursorY - monitor.PhysicalBounds.Top) / monitor.DpiScale;
 
-        // If a flight animator exists, use its position — this keeps the triangle
-        // planted at the target after landing, not just during the flight itself
-        if (_flightAnimator != null)
+        // While a flight lifecycle is active, override the triangle position.
+        if (_flightPhase != FlightPhase.None)
         {
-            var pos = _flightAnimator.CurrentPosition;
-            localX = pos.X;
-            localY = pos.Y;
+            if (_flightPhase == FlightPhase.HoldingAtTarget)
+            {
+                // No animator is running during the hold — use the saved landing position.
+                localX = _holdPosition.X;
+                localY = _holdPosition.Y;
+            }
+            else if (_flightAnimator != null)
+            {
+                // Use the in-progress animation position (outbound or return flight).
+                var pos = _flightAnimator.CurrentPosition;
+                localX = pos.X;
+                localY = pos.Y;
+            }
         }
 
         _activeOverlay.SetTrianglePosition(localX, localY);
@@ -188,9 +302,17 @@ public class OverlayManager : IDisposable
     public void SetState(AppState state)
     {
         _state = state;
-        // Clear the flight target when going Idle so cursor tracking resumes
-        if (state == AppState.Idle)
-            _flightAnimator = null;
+
+        // When a new recording starts, immediately cancel any active flight so the triangle
+        // snaps back to cursor tracking — the user has moved on to a new interaction.
+        if (state == AppState.Recording && _flightPhase != FlightPhase.None)
+        {
+            Log.Debug("Recording started — cancelling active flight (phase: {Phase})", _flightPhase);
+            ClearFlightAnimator();
+        }
+
+        // When transitioning back to Idle after Speaking, the hold timer in UpdateFlightLifecycle
+        // will now start counting — no explicit action needed here. The lifecycle finishes itself.
     }
 
     public void SetWaveformLevels(double[] levels)
@@ -219,6 +341,8 @@ public class OverlayManager : IDisposable
             new System.Windows.Point(localX, localY),
             duration: 0.4);
         _flightAnimator.Start();
+        _flightPhase = FlightPhase.FlyingToTarget;
+        _holdElapsed = 0;
     }
 
     public List<MonitorInfo> GetMonitors() => _monitors;
@@ -230,6 +354,21 @@ public class OverlayManager : IDisposable
             overlay.Close();
         _overlays.Clear();
     }
+}
+
+/// <summary>
+/// Phases of the triangle pointing lifecycle.
+/// None = following cursor normally.
+/// FlyingToTarget = outbound Bezier animation toward the pointed element.
+/// HoldingAtTarget = triangle planted at target while AI is speaking (and briefly after).
+/// ReturningToCursor = return Bezier animation back to current cursor position.
+/// </summary>
+public enum FlightPhase
+{
+    None,
+    FlyingToTarget,
+    HoldingAtTarget,
+    ReturningToCursor
 }
 
 public enum AppState

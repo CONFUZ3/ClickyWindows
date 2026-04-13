@@ -4,12 +4,28 @@ namespace ClickyWindows.Helpers;
 
 /// <summary>
 /// Maps between coordinate spaces:
-/// - Screenshot pixel coords (physical, per-monitor)
+/// - Screenshot pixel coords (scaled down from physical, reported to Gemini)
+/// - Physical pixel coords (raw screen coords, what GetCursorPos returns)
 /// - Virtual desktop coords (logical WPF units from top-left of virtual desktop)
 /// - Per-overlay-window local coords
 /// </summary>
 public static class CoordinateTransform
 {
+    /// <summary>
+    /// Scale screenshot-space coordinates back to physical monitor pixels.
+    /// Gemini outputs coordinates in the scaled screenshot space; this undoes the scale
+    /// so the result can be combined with monitor.PhysicalBounds.Left/Top for absolute coords.
+    /// </summary>
+    public static (int PhysX, int PhysY) ScreenshotToPhysical(
+        int screenshotX, int screenshotY,
+        int screenshotWidth, int screenshotHeight,
+        int physicalWidth, int physicalHeight)
+    {
+        int physX = (int)Math.Round(screenshotX * ((double)physicalWidth / screenshotWidth));
+        int physY = (int)Math.Round(screenshotY * ((double)physicalHeight / screenshotHeight));
+        return (physX, physY);
+    }
+
     /// <summary>
     /// Convert Claude [POINT] coords (screenshot pixel space) to virtual desktop logical coords.
     /// </summary>

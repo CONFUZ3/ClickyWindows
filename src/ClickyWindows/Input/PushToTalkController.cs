@@ -19,11 +19,15 @@ public class PushToTalkController : IDisposable
     private int _turnVersion;
 
     private GeminiLiveService? _gemini;
+    private GeminiFlashPointingService? _flashPointing;
     private readonly AudioPlaybackService _playback;
     private readonly MicrophoneRecorder _recorder;
     private readonly ScreenCaptureService _screenCapture;
     private readonly string? _geminiApiKey;
     private readonly Queue<byte[]> _audioBuffer = new();
+
+    // Saved at screenshot-capture time so OnGeminiInputTranscription can pass them to the Flash pointing call.
+    private List<ScreenCapture> _lastScreenCaptures = new();
 
     private readonly ConversationHistory _history;
     private string? _pendingScreenshot;
@@ -58,6 +62,9 @@ public class PushToTalkController : IDisposable
 
         _geminiApiKey = CredentialStore.GetKey(CredentialStore.GeminiTarget);
         _history = ConversationHistory.Load(HistoryPath);
+
+        if (!string.IsNullOrEmpty(_geminiApiKey))
+            _flashPointing = new GeminiFlashPointingService(_geminiApiKey, settings.Gemini.PointingModel);
 
         _recorder.LevelsUpdated += levels =>
         {
@@ -200,9 +207,14 @@ public class PushToTalkController : IDisposable
             }
 
             var captures = _screenCapture.CaptureAll(monitors);
+            // Save captures so OnGeminiInputTranscription can pass them to the Flash pointing call.
+            _lastScreenCaptures = captures;
             if (captures.Any())
             {
-                _pendingScreenshot = captures.First().Base64Jpeg;
+                // Send the focused monitor's screenshot — the same one Flash pointing uses.
+                // captures.First() could be a background monitor; IsFocus tracks the primary.
+                var focusedCapture = captures.FirstOrDefault(c => c.IsFocus) ?? captures.First();
+                _pendingScreenshot = focusedCapture.Base64Jpeg;
                 await gemini.SendScreenshotAsync(_pendingScreenshot, token);
             }
         }
@@ -346,6 +358,65 @@ public class PushToTalkController : IDisposable
     {
         _pendingUserTranscript = transcript;
         Log.Information("User transcript: {Text}", transcript);
+
+        // Fire the Flash pointing call immediately in parallel with Live's audio response.
+        // We capture turnVersion and captures by value so a concurrent new turn can't affect this call.
+        var capturedTurnVersion = _turnVersion;
+        var capturedCaptures = _lastScreenCaptures;
+        var monitors = _overlay.GetMonitors();
+        _ = Task.Run(() => RunFlashPointingAsync(transcript, capturedCaptures, monitors, capturedTurnVersion));
+    }
+
+    private async Task RunFlashPointingAsync(
+        string userTranscript,
+        List<ScreenCapture> screenCaptures,
+        IReadOnlyList<MonitorInfo> monitors,
+        int capturedTurnVersion)
+    {
+        try
+        {
+            // Use the primary (focus) monitor's capture, falling back to the first available.
+            var primaryCapture = screenCaptures.FirstOrDefault(c => c.IsFocus)
+                              ?? screenCaptures.FirstOrDefault();
+            if (primaryCapture == null || _flashPointing == null) return;
+
+            var primaryMonitor = monitors.Count > primaryCapture.MonitorIndex
+                ? monitors[primaryCapture.MonitorIndex]
+                : monitors.FirstOrDefault();
+            if (primaryMonitor == null) return;
+
+            CancellationToken token;
+            try { token = _interactionCts?.Token ?? CancellationToken.None; }
+            catch (ObjectDisposedException) { return; }
+
+            var pointTarget = await _flashPointing.GetPointAsync(
+                primaryCapture, userTranscript, primaryMonitor, token);
+
+            if (pointTarget == null) return;
+
+            // Drop stale results if the user started a new turn while Flash was in flight.
+            lock (_stateLock)
+            {
+                if (_turnVersion != capturedTurnVersion) return;
+            }
+
+            var phrase = NavigationPhrases[Random.Shared.Next(NavigationPhrases.Length)];
+            System.Windows.Application.Current?.Dispatcher.BeginInvoke(() =>
+            {
+                _overlay.SetSpeechBubble(phrase);
+                _overlay.StartFlightTo(
+                    primaryMonitor.PhysicalBounds.Left + pointTarget.X,
+                    primaryMonitor.PhysicalBounds.Top + pointTarget.Y,
+                    primaryMonitor);
+            });
+
+            Log.Information("Flash pointing: ({X},{Y}) — {Label}", pointTarget.X, pointTarget.Y, pointTarget.Label);
+        }
+        catch (OperationCanceledException) { }
+        catch (Exception ex)
+        {
+            Log.Warning(ex, "Flash pointing call failed — triangle will not move for this turn");
+        }
     }
 
     private void OnGeminiTextChunkReceived(string textChunk)
@@ -356,26 +427,8 @@ public class PushToTalkController : IDisposable
     private void OnGeminiTextCompleted(string text)
     {
         Log.Information("Gemini text completed: {Text}", text);
+        // Strip any stray POINT tags the Live model might emit before saving to history.
         _pendingAssistantText = PointTagRegex.Replace(text, "").Trim();
-
-        var monitors = _overlay.GetMonitors();
-        var points = PointParser.ParseAll(text, monitors);
-
-        if (points.Count > 0)
-        {
-            var pt = points[0];
-            var monitor = monitors.Count > pt.ScreenIndex ? monitors[pt.ScreenIndex] : monitors[0];
-            var phrase = NavigationPhrases[Random.Shared.Next(NavigationPhrases.Length)];
-
-            System.Windows.Application.Current?.Dispatcher.BeginInvoke(() =>
-            {
-                _overlay.SetSpeechBubble(phrase);
-                _overlay.StartFlightTo(
-                    monitor.PhysicalBounds.Left + pt.X,
-                    monitor.PhysicalBounds.Top + pt.Y,
-                    monitor);
-            });
-        }
     }
 
     private void OnGeminiTurnComplete()

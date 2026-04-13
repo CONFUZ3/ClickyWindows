@@ -67,7 +67,14 @@ public class GeminiLiveService : IAsyncDisposable
         // the socket with InvalidPayloadData regardless. systemInstruction is the
         // broadly-supported path for providing context to a Live session.
         var systemInstructionText = BuildSystemInstruction(history, monitors);
+        Log.Debug("System instruction length: {Len} chars, history turns: {Turns}", systemInstructionText.Length, history.Count);
 
+        // inputAudioTranscription lives at the setup root (transcribes the user's mic input).
+        // outputAudioTranscription lives inside generationConfig (transcribes the model's audio output).
+        // Mixing them up causes InvalidPayloadData or InternalServerError from the API.
+        // Both inputAudioTranscription and outputAudioTranscription are top-level fields
+        // of the BidiGenerateContentSetup message, NOT children of generationConfig.
+        // Placing either inside generationConfig causes InvalidPayloadData from the API.
         var setupObj = new JsonObject
         {
             ["model"] = _settings.Model,
@@ -96,6 +103,7 @@ public class GeminiLiveService : IAsyncDisposable
 
         var setupMsg = new JsonObject { ["setup"] = setupObj };
         var setupJson = setupMsg.ToJsonString();
+        Log.Debug("Gemini setup JSON: {Json}", setupJson.Length > 500 ? setupJson[..500] + "…" : setupJson);
         await _sendLock.WaitAsync(_connectionCts.Token);
         try
         {
@@ -184,43 +192,17 @@ public class GeminiLiveService : IAsyncDisposable
                                                   IReadOnlyList<MonitorInfo> monitors)
     {
         var sb = new StringBuilder();
-        sb.Append("You are Clicky, a friendly on-screen voice assistant. Keep replies short, natural, and conversational. ");
-        sb.AppendLine("You can see the user's screen via screenshots.");
+        sb.AppendLine("You are Clicky, a voice assistant that helps users navigate and understand their screen.");
+        sb.AppendLine("You receive a screenshot of the user's screen at the start of each turn.");
         sb.AppendLine();
-
-        // Tell Gemini the exact pixel dimensions of each screenshot it will receive.
-        // Without this, Gemini guesses at the coordinate space and produces wrong coordinates.
-        if (monitors.Count > 0)
-        {
-            sb.AppendLine("SCREEN COORDINATE SPACE:");
-            for (int i = 0; i < monitors.Count; i++)
-            {
-                var m = monitors[i];
-                sb.AppendLine($"  screen{i}: {m.PhysicalBounds.Width}x{m.PhysicalBounds.Height} pixels (x: 0–{m.PhysicalBounds.Width - 1}, y: 0–{m.PhysicalBounds.Height - 1})");
-            }
-            sb.AppendLine("Only use screen0 — only the primary screen's screenshot is sent to you.");
-            sb.AppendLine();
-        }
-
-        sb.AppendLine("POINTING RULES — a visual triangle cursor will fly to any [POINT] tag you emit, so use them deliberately:");
+        sb.AppendLine("RULES FOR SCREEN QUESTIONS:");
+        sb.AppendLine("- Base every answer about the screen ONLY on what you can literally see in the screenshot.");
+        sb.AppendLine("- Do NOT use your general knowledge of what an app usually looks like to fill in gaps.");
+        sb.AppendLine("- Do NOT describe, infer, or mention UI elements, text, or content that is not visible.");
+        sb.AppendLine("- If the user asks about something you cannot see, say so clearly: \"I don't see that on your screen.\"");
+        sb.AppendLine("- If the screenshot is unclear or the element is hard to read, say so rather than guessing.");
         sb.AppendLine();
-        sb.AppendLine("USE a [POINT] tag ONLY when one of these is true:");
-        sb.AppendLine("  1. The user asks WHERE something is (\"where is X?\", \"find X\", \"show me X\").");
-        sb.AppendLine("  2. The user asks to click, open, or navigate to a specific element.");
-        sb.AppendLine("  3. The user asks you to highlight or point at something specific.");
-        sb.AppendLine("  4. Your reply references a specific, identifiable UI element by name AND pointing it out adds clear value.");
-        sb.AppendLine();
-        sb.AppendLine("DO NOT use a [POINT] tag when:");
-        sb.AppendLine("  - The user is asking a general question or having a conversation.");
-        sb.AppendLine("  - You are describing what is on screen in general terms.");
-        sb.AppendLine("  - The user is asking about memory, history, or previous context.");
-        sb.AppendLine("  - Your reply does not reference a specific clickable or locatable UI element.");
-        sb.AppendLine("  - The answer is the whole screen or a vague area — only point if you can identify a precise spot.");
-        sb.AppendLine();
-        sb.AppendLine("When you DO point, embed exactly one tag anywhere in your response text, in this EXACT format:");
-        sb.AppendLine("  [POINT:x,y:short_label:screen0]");
-        sb.AppendLine("Example: \"The share button is right here [POINT:1456,42:Share button:screen0] in the top right.\"");
-        sb.Append("x and y must be integers within the screen0 pixel bounds listed above. The square brackets are required.");
+        sb.Append("Keep replies short, natural, and conversational.");
 
         if (history.Count > 0)
         {
@@ -265,7 +247,7 @@ public class GeminiLiveService : IAsyncDisposable
                 var result = await _webSocket!.ReceiveAsync(new ArraySegment<byte>(buffer), token);
                 if (result.MessageType == WebSocketMessageType.Close)
                 {
-                    Log.Information("Gemini WebSocket closed: {Status} - {Desc}", result.CloseStatus, result.CloseStatusDescription);
+                    Log.Warning("Gemini WebSocket closed: {Status} — {Desc}", result.CloseStatus, result.CloseStatusDescription);
                     _setupCompleteTcs?.TrySetException(new Exception($"WebSocket closed: {result.CloseStatusDescription}"));
                     ErrorOccurred?.Invoke(new Exception($"WebSocket closed: {result.CloseStatusDescription}"));
                     break;
@@ -277,6 +259,9 @@ public class GeminiLiveService : IAsyncDisposable
                 {
                     var messageText = Encoding.UTF8.GetString(messageBuilder.ToArray());
                     messageBuilder.Clear();
+                    Log.Debug("Gemini raw message ({Len} chars): {Msg}",
+                        messageText.Length,
+                        messageText.Length > 200 ? messageText[..200] + "…" : messageText);
                     ProcessMessage(messageText);
                 }
             }

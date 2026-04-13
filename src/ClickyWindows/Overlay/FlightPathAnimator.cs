@@ -17,6 +17,9 @@ public class FlightPathAnimator
     public bool IsFlying => _isFlying;
     public System.Windows.Point CurrentPosition { get; private set; }
 
+    // The landing position — used by OverlayManager to hold the triangle there after flight ends.
+    public System.Windows.Point EndPosition => _end;
+
     public FlightPathAnimator(System.Windows.Point start, System.Windows.Point end, double duration = 0.4)
     {
         _start = start;
