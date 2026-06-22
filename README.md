@@ -106,7 +106,7 @@ The triangle animates to whatever screen element Gemini references in its reply.
     "ConnectTimeoutMs": 5000
   },
   "OpenAi": {
-    "Model": "gpt-realtime",
+    "Model": "gpt-realtime-2",
     "VoiceName": "marin",
     "PointingModel": "gpt-4o",
     "ConnectTimeoutMs": 5000

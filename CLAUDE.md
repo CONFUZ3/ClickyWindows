@@ -16,7 +16,7 @@ The API key is stored in Windows Credential Manager. Nothing sensitive ships in 
 - **App Type**: System tray-only (`ShowInTaskbar=false`, `WindowStyle=None`), no main window
 - **Framework**: WPF (.NET 8) with Win32 P/Invoke for overlay, global hooks, DPI, and Credential Manager
 - **Pattern**: Event-driven with a `PushToTalkController` state machine as the central coordinator
-- **AI / STT / TTS**: A realtime voice provider (`IRealtimeVoiceService`) handles all three in one bidirectional WebSocket. Implementations: `GeminiLiveService` (`gemini-3.1-flash-live-preview`, default) and `OpenAiRealtimeService` (`gpt-realtime`). Built by `AiProviderFactory` from the `Provider` setting.
+- **AI / STT / TTS**: A realtime voice provider (`IRealtimeVoiceService`) handles all three in one bidirectional WebSocket. Implementations: `GeminiLiveService` (`gemini-3.1-flash-live-preview`, default) and `OpenAiRealtimeService` (`gpt-realtime-2`). Built by `AiProviderFactory` from the `Provider` setting.
 - **Screen Capture**: `BitBlt` via GDI+, multi-monitor aware
 - **Voice Input**: Push-to-talk via `NAudio` `WasapiCapture`, mono PCM. Sample rate is provider-driven (`IRealtimeVoiceService.InputSampleRateHz`): Gemini = 16kHz, OpenAI = 24kHz.
 - **Audio Playback**: `NAudio` `WasapiOut` (24kHz mono PCM — both providers output 24kHz)

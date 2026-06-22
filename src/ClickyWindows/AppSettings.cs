@@ -37,8 +37,8 @@ public class GeminiSettings
 
 public class OpenAiSettings
 {
-    // Realtime (voice) model — the GA family is "gpt-realtime"; pin a dated snapshot here if needed.
-    public string Model { get; set; } = "gpt-realtime";
+    // Realtime (voice) model — current GA model id; change here to pin a different snapshot.
+    public string Model { get; set; } = "gpt-realtime-2";
     public string VoiceName { get; set; } = "marin";
     public int ConnectTimeoutMs { get; set; } = 5000;
     // Vision model used by OpenAiPointingService (chat completions) to locate UI elements.
