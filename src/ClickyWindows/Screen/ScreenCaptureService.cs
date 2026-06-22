@@ -15,17 +15,22 @@ public record ScreenCapture(string Base64Jpeg, int Width, int Height, int Physic
 /// <summary>
 /// Captures screens using Graphics.CopyFromScreen.
 /// Screenshots are scaled to at most MaxScreenshotDimension on the longest edge before sending to
-/// Gemini. This keeps the coordinate space small and matches the resolution that vision models
-/// reason most accurately about. Coordinates Gemini returns must be scaled back to physical
-/// pixels using the Width/PhysicalWidth ratio in ScreenCapture.
+/// Gemini. With mediaResolution: HIGH set in the Live setup, Gemini tiles the image into 768x768
+/// patches and benefits from higher input resolution; the cap exists only to bound WebSocket
+/// payload size and the upload latency that gates audio streaming. Coordinates Gemini returns
+/// must be scaled back to physical pixels using the Width/PhysicalWidth ratio in ScreenCapture.
 /// </summary>
 public class ScreenCaptureService
 {
-    private const int JpegQuality = 80;
+    // Q92 is visually lossless for UI screenshots (q80 introduced JPEG block artifacts and
+    // chroma subsampling that softened small text). Roughly doubles bytes vs q80.
+    private const int JpegQuality = 92;
 
     // Max pixel dimension (width or height) for screenshots sent to Gemini.
-    // Smaller images keep coordinate error small and match vision model internal resolutions.
-    public const int MaxScreenshotDimension = 1280;
+    // 1920 covers native 1080p without downscaling and gives 4K screens a 2x bump
+    // (1920x1080 vs the previous 1280x720). Pairs with mediaResolution: HIGH so the
+    // model actually uses the extra detail.
+    public const int MaxScreenshotDimension = 1920;
 
     /// <summary>
     /// Compute the screenshot dimensions that CaptureMonitor will produce for a physical resolution.

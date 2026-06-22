@@ -5,20 +5,22 @@
 
 ## Overview
 
-Windows WPF tray application that ports the macOS [Clicky](https://github.com/farzaa/clicky) AI companion to Windows. Lives entirely in the system tray (no taskbar icon, no main window). A transparent full-screen overlay hosts a blue triangle cursor that can fly to and point at UI elements on any connected monitor. Push-to-talk (Ctrl+Alt hold) streams microphone audio and a screenshot directly to the **Gemini Live API** over a bidirectional WebSocket. Gemini handles speech recognition, LLM reasoning, and TTS audio synthesis in one session — no separate transcription or TTS service.
+Windows WPF tray application that ports the macOS [Clicky](https://github.com/farzaa/clicky) AI companion to Windows. Lives entirely in the system tray (no taskbar icon, no main window). A transparent full-screen overlay hosts a blue triangle cursor that can fly to and point at UI elements on any connected monitor. Push-to-talk (Ctrl+Alt hold) streams microphone audio and a screenshot to a **realtime voice + vision provider** over a bidirectional WebSocket, which handles speech recognition, LLM reasoning, and TTS audio synthesis in one session — no separate transcription or TTS service.
 
-The Gemini API key is stored in Windows Credential Manager. Nothing sensitive ships in the app or config files.
+Two providers are supported behind a common abstraction (`IRealtimeVoiceService` + `IPointingService`), chosen by the `Provider` setting: **Gemini Live** (default) and **OpenAI Realtime**. Each uses only its own API key.
+
+The API key is stored in Windows Credential Manager. Nothing sensitive ships in the app or config files.
 
 ## Architecture
 
 - **App Type**: System tray-only (`ShowInTaskbar=false`, `WindowStyle=None`), no main window
 - **Framework**: WPF (.NET 8) with Win32 P/Invoke for overlay, global hooks, DPI, and Credential Manager
 - **Pattern**: Event-driven with a `PushToTalkController` state machine as the central coordinator
-- **AI / STT / TTS**: Gemini Live API (`gemini-3.1-flash-live-preview`) — single bidirectional WebSocket handles all three
+- **AI / STT / TTS**: A realtime voice provider (`IRealtimeVoiceService`) handles all three in one bidirectional WebSocket. Implementations: `GeminiLiveService` (`gemini-3.1-flash-live-preview`, default) and `OpenAiRealtimeService` (`gpt-realtime`). Built by `AiProviderFactory` from the `Provider` setting.
 - **Screen Capture**: `BitBlt` via GDI+, multi-monitor aware
-- **Voice Input**: Push-to-talk via `NAudio` `WasapiCapture` (16kHz mono PCM)
-- **Audio Playback**: `NAudio` `WasapiOut` (24kHz mono PCM from Gemini)
-- **Element Pointing**: Gemini embeds `[POINT:x,y:label:screenN]` tags in responses. `PointParser` maps coordinates to the correct monitor and `FlightPathAnimator` animates the triangle via a cubic Bezier arc.
+- **Voice Input**: Push-to-talk via `NAudio` `WasapiCapture`, mono PCM. Sample rate is provider-driven (`IRealtimeVoiceService.InputSampleRateHz`): Gemini = 16kHz, OpenAI = 24kHz.
+- **Audio Playback**: `NAudio` `WasapiOut` (24kHz mono PCM — both providers output 24kHz)
+- **Element Pointing**: A separate vision call (`IPointingService`: `GeminiFlashPointingService` or `OpenAiPointingService`) returns normalized `{x,y,label}` coordinates; `PointingHelper` parses them to physical pixels and `FlightPathAnimator` animates the triangle via a cubic Bezier arc.
 - **API Key Storage**: Windows Credential Manager via `CredRead`/`CredWrite` P/Invoke. Set by the first-run `SetupWizardWindow`.
 
 ### Data Flow
@@ -57,38 +59,48 @@ Echo prevention: hotkey press during SPEAKING or PROCESSING cancels the active s
 - **Monitor enumeration**: `EnumDisplayMonitors` + `GetDpiForMonitor` P/Invoke — not `Screen.AllScreens` (confirmed DPI bugs, dotnet/winforms#10952).
 - **Audio playback**: `WasapiOut` shared mode (~10–30ms latency) with 250ms pre-buffer before `Play()`.
 - **Gemini WebSocket**: URI is `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key=…`. First message is a `setup` frame with `responseModalities: ["AUDIO"]`, `inputAudioTranscription: {}`, `outputAudioTranscription: {}`, and `speechConfig`. Blocks on `setupComplete` (5s timeout) before streaming.
-- **History via systemInstruction**: `initialHistoryInClientContent` causes `InvalidPayloadData` socket close on `gemini-3.1-flash-live-preview`. Prior turns are embedded into `systemInstruction` at setup time instead. See `GeminiLiveService.BuildSystemInstruction`.
+- **History via systemInstruction**: `initialHistoryInClientContent` causes `InvalidPayloadData` socket close on `gemini-3.1-flash-live-preview`. Prior turns are embedded into `systemInstruction` at setup time instead. The instruction is built by `SystemInstructionBuilder.Build` (shared by both providers).
+- **Provider abstraction**: `PushToTalkController` drives every turn through `IRealtimeVoiceService` and `IPointingService` only; it never names a provider. `AiProviderFactory` maps the `Provider` setting (`"Gemini"`/`"OpenAI"`) to concrete services and pulls the matching key (`CredentialStore.TargetForProvider`). Adding a provider = two new classes + a factory branch.
+- **OpenAI Realtime**: URI `wss://api.openai.com/v1/realtime?model=…` with an `Authorization: Bearer` header (no `OpenAI-Beta` header on GA). Push-to-talk maps to manual turn control: server VAD is disabled and `CompleteTurnAsync` sends `input_audio_buffer.commit` + `response.create`. Input transcription (which drives the pointing call) is enabled in the `session.update` frame; the connect gate blocks on `session.updated`.
 - **Session lifecycle**: Each push-to-talk turn creates a new `GeminiLiveService`. The previous session's disposal task is stored in `_geminiDisposalTask` so the new turn awaits full WebSocket teardown before opening a fresh connection (prevents socket leaks). All disposal runs **outside** `_stateLock` to avoid deadlocks with playback callbacks.
 - **Turn versioning**: `_turnVersion` is incremented on every state transition. Late-arriving callbacks from a superseded session are dropped by comparing the captured version.
 - **Namespace collisions**: The project uses both `UseWPF` and `UseWindowsForms`. Qualify ambiguous types: `System.Windows.Application`, `System.Windows.Media.Color`, `System.Windows.Point`. All P/Invoke declarations live in `Interop/NativeMethods.cs`.
 
 ### `[POINT]` Coordinate Format
 
-Gemini emits `[POINT:x,y:short_label:screenN]` where `x,y` are physical pixels relative to the monitor's top-left and `N` is the 0-based monitor index. The format is specified in the system instruction built by `GeminiLiveService.BuildSystemInstruction`. `PointParser` validates and clamps coordinates; `FlightPathAnimator` flies the triangle via a cubic Bezier arc with a 40px tolerance zone. Point tags are stripped from text before it is saved to `ConversationHistory`.
+Pointing is decided by a separate vision call (`IPointingService`), not by the voice response: the provider returns a normalized `{x,y,label}` object that `PointingHelper` converts to physical pixels (relative to the monitor's top-left), and `FlightPathAnimator` flies the triangle there via a cubic Bezier arc with a 40px tolerance zone. The legacy inline `[POINT:x,y:short_label:screenN]` tag form is still stripped from text before it is saved to `ConversationHistory` (`PushToTalkController.PointTagRegex`). The shared voice system instruction is built by `SystemInstructionBuilder.Build`.
 
 ## Key Files
 
 | File | Lines | Purpose |
 |------|-------|---------|
-| `App.xaml.cs` | ~134 | Entry point. Bootstraps tray icon, overlay, hotkey service, and `PushToTalkController`. Runs first-run `SetupWizardWindow` if the Gemini key is missing. |
-| `AppSettings.cs` | ~28 | Strongly-typed settings bound from `appsettings.json` (hotkey, audio, Gemini model/voice). |
-| `Input/PushToTalkController.cs` | ~519 | Central state machine. Owns the Gemini session lifecycle, microphone streaming, screenshot capture, audio playback, point parsing, conversation history, and all turn transitions. |
-| `AI/GeminiLiveService.cs` | ~379 | Gemini Live API WebSocket client. Manages setup handshake, bidirectional audio/text streaming, `setupComplete` gate, and graceful teardown. Fires `AudioReceived`, `TextCompleted`, `InputTranscriptionReceived`, `TurnComplete`, and `ErrorOccurred` events. |
+| `App.xaml.cs` | ~137 | Entry point. Bootstraps tray icon, overlay, hotkey service, and `PushToTalkController`; wires turn-failure messages to a tray balloon. Runs first-run `SetupWizardWindow` if the selected provider's key is missing. |
+| `AppSettings.cs` | ~48 | Strongly-typed settings bound from `appsettings.json`: `Provider`, hotkey, audio, and per-provider `GeminiSettings`/`OpenAiSettings`. |
+| `Input/PushToTalkController.cs` | ~540 | Central state machine. Owns the provider session lifecycle (via `IRealtimeVoiceService`/`IPointingService`), microphone streaming, screenshot capture, audio playback, conversation history, and all turn transitions. Raises `ErrorMessageRaised` on failure. |
+| `AI/IRealtimeVoiceService.cs` | ~58 | Interface for realtime voice providers (events, `ConnectAsync`/`SendAudioAsync`/`SendScreenshotAsync`/`CompleteTurnAsync`, `InputSampleRateHz`). |
+| `AI/IPointingService.cs` | ~25 | Interface for the per-provider pointing call (`GetPointAsync`). |
+| `AI/AiProviderFactory.cs` | ~22 | Builds the voice + pointing services for the configured `Provider`. |
+| `AI/SystemInstructionBuilder.cs` | ~73 | Builds the system instruction (grounding rules + history) shared by both voice providers. |
+| `AI/GeminiLiveService.cs` | ~330 | Gemini Live API WebSocket client implementing `IRealtimeVoiceService`. Setup handshake, bidirectional streaming, `setupComplete` gate, graceful teardown. |
+| `AI/OpenAiRealtimeService.cs` | ~290 | OpenAI Realtime API WebSocket client implementing `IRealtimeVoiceService`. `session.update` config, manual turn control (commit + `response.create`), `session.updated` gate. |
+| `AI/GeminiFlashPointingService.cs` | ~105 | Gemini vision REST call (`generateContent`) implementing `IPointingService`. |
+| `AI/OpenAiPointingService.cs` | ~110 | OpenAI vision REST call (chat completions) implementing `IPointingService`. |
+| `AI/PointingHelper.cs` | ~120 | Shared pointing prompt and normalized-→-physical coordinate parsing for both pointing services. |
 | `AI/ConversationHistory.cs` | ~76 | Loads/saves conversation turns as JSON. Text-only — screenshots are never stored. |
-| `AI/CredentialStore.cs` | ~76 | Reads and writes API keys via Windows Credential Manager (`CredRead`/`CredWrite`). Target: `ClickyWindows/GeminiApiKey`. |
+| `AI/CredentialStore.cs` | ~70 | Reads/writes API keys via Windows Credential Manager. Targets: `ClickyWindows/GeminiApiKey`, `ClickyWindows/OpenAiApiKey`. `HasKeyForProvider`/`TargetForProvider` select by provider. |
 | `Input/GlobalHotkeyService.cs` | ~204 | `WH_KEYBOARD_LL` low-level keyboard hook. Publishes press/release events for the configured hotkey. Health-check timer re-registers the hook every 5s. |
 | `Overlay/OverlayManager.cs` | ~225 | Manages the full-screen transparent `OverlayWindow`. Exposes state transitions, speech bubble text, waveform levels, flight animations, and monitor geometry to the controller. |
 | `Overlay/OverlayWindow.xaml.cs` | ~120 | WPF window with `WS_EX_TRANSPARENT | WS_EX_LAYERED | WS_EX_TOOLWINDOW`. Hosts the animated blue triangle and response text. |
 | `Overlay/FlightPathAnimator.cs` | ~77 | Animates the triangle to a target coordinate via a cubic Bezier arc. 40px arrival tolerance. |
-| `Audio/MicrophoneRecorder.cs` | ~78 | `WasapiCapture` wrapper. Streams 16kHz mono PCM buffers and reports audio levels for waveform display. |
+| `Audio/MicrophoneRecorder.cs` | ~78 | `WaveInEvent` wrapper. Streams mono PCM at a provider-chosen sample rate (16kHz Gemini / 24kHz OpenAI) and reports audio levels for waveform display. |
 | `Audio/AudioPlaybackService.cs` | ~149 | `WasapiOut` wrapper. Accepts streaming PCM chunks, pre-buffers 250ms before playback starts, and fires `PlaybackCompleted` when the stream drains. |
 | `Audio/AudioLevelMonitor.cs` | ~54 | Computes RMS levels from PCM buffers for waveform visualization. |
 | `Screen/ScreenCaptureService.cs` | ~92 | Multi-monitor screenshot capture via GDI+ `BitBlt`. Returns JPEG base64 per monitor. |
 | `Screen/MonitorEnumerator.cs` | ~82 | `EnumDisplayMonitors` + `GetDpiForMonitor` P/Invoke. Returns DPI-aware `MonitorInfo` for all connected displays. |
 | `AI/PointParser.cs` | ~58 | Parses `[POINT:x,y:label:screenN]` tags from Gemini text. Validates and clamps to monitor bounds. |
 | `AI/ProxyClient.cs` | ~58 | Unused legacy HTTP client (retained for reference, not wired up). |
-| `Tray/TrayIconManager.cs` | ~104 | `NotifyIcon` lifecycle. Tray menu with status, settings link, and quit. |
-| `Setup/SetupWizardWindow.xaml.cs` | ~71 | First-run wizard. Prompts for the Gemini API key and saves it to Credential Manager. |
+| `Tray/TrayIconManager.cs` | ~120 | `NotifyIcon` lifecycle. Tray menu with status, settings link, and quit; `ShowError` surfaces turn failures as a balloon. |
+| `Setup/SetupWizardWindow.xaml.cs` | ~85 | First-run wizard. Prompts for the selected provider's API key (Gemini and/or OpenAI) and saves to Credential Manager. |
 | `Interop/NativeMethods.cs` | ~156 | All Win32 P/Invoke declarations (overlay window flags, hooks, DPI, Credential Manager). |
 | `Helpers/CoordinateTransform.cs` | ~42 | Converts physical pixel coordinates to WPF device-independent units for overlay positioning. |
 | `Helpers/DpiHelper.cs` | ~18 | Per-monitor DPI scale helpers. |

@@ -11,6 +11,7 @@ namespace ClickyWindows.AI;
 public static class CredentialStore
 {
     public const string GeminiTarget = "ClickyWindows/GeminiApiKey";
+    public const string OpenAiTarget = "ClickyWindows/OpenAiApiKey";
 
     /// <summary>Returns the stored secret for <paramref name="target"/>, or null if not found.</summary>
     public static string? GetKey(string target)
@@ -62,15 +63,13 @@ public static class CredentialStore
         }
     }
 
-    /// <summary>Returns true only if the Gemini API key is present in Credential Manager.</summary>
-    public static bool HasAllKeys() =>
-        GetKey(GeminiTarget) != null;
+    /// <summary>Credential Manager target holding the API key for the given provider.</summary>
+    public static string TargetForProvider(string provider) =>
+        provider?.Trim().Equals("openai", StringComparison.OrdinalIgnoreCase) == true
+            ? OpenAiTarget
+            : GeminiTarget;
 
-    public static IReadOnlyList<string> GetMissingKeyNames()
-    {
-        var missing = new List<string>();
-        if (string.IsNullOrWhiteSpace(GetKey(GeminiTarget)))
-            missing.Add("Gemini");
-        return missing;
-    }
+    /// <summary>Returns true when the selected provider's API key is present in Credential Manager.</summary>
+    public static bool HasKeyForProvider(string provider) =>
+        !string.IsNullOrWhiteSpace(GetKey(TargetForProvider(provider)));
 }

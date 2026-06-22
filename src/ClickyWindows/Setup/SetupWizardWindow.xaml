@@ -31,8 +31,9 @@
         <TextBlock Text="Welcome to Clicky for Windows"
                    FontSize="18" FontWeight="Bold" Margin="0,0,0,6"/>
         <TextBlock TextWrapping="Wrap" Margin="0,0,0,20" Foreground="#555">
-            Enter your Gemini API key below. It is stored securely in Windows
-            Credential Manager — never saved to any file.
+            Enter the API key for your chosen provider. The active provider is set by
+            "Provider" in appsettings.json (Gemini or OpenAI). Keys are stored securely in
+            Windows Credential Manager — never saved to any file.
         </TextBlock>
 
         <!-- Gemini -->
@@ -44,6 +45,20 @@
             </Hyperlink>
         </TextBlock>
         <PasswordBox x:Name="GeminiKeyBox"/>
+        <TextBlock TextWrapping="Wrap" Margin="0,-10,0,16" Foreground="#888" FontSize="11">
+            As of June 19, 2026 Gemini rejects unrestricted keys. In AI Studio, restrict your
+            key to the Gemini API, or create a new key.
+        </TextBlock>
+
+        <!-- OpenAI -->
+        <TextBlock Style="{StaticResource Label}" Text="OpenAI API Key (for Provider: OpenAI)"/>
+        <TextBlock Style="{StaticResource Link}">
+            <Hyperlink NavigateUri="https://platform.openai.com/api-keys"
+                       RequestNavigate="OnLinkNavigate">
+                Get your key at platform.openai.com →
+            </Hyperlink>
+        </TextBlock>
+        <PasswordBox x:Name="OpenAiKeyBox"/>
 
         <!-- Error -->
         <TextBlock x:Name="ErrorText"

@@ -18,12 +18,15 @@ public class PushToTalkController : IDisposable
     private bool _isHotkeyHeld;
     private int _turnVersion;
 
-    private GeminiLiveService? _gemini;
-    private GeminiFlashPointingService? _flashPointing;
+    private IRealtimeVoiceService? _gemini;
+    private IPointingService? _flashPointing;
     private readonly AudioPlaybackService _playback;
     private readonly MicrophoneRecorder _recorder;
     private readonly ScreenCaptureService _screenCapture;
-    private readonly string? _geminiApiKey;
+    private readonly string _provider;
+    private readonly string? _apiKey;
+    // Whether the active provider needs the screenshot sent before microphone audio streams.
+    private readonly bool _requireScreenshotBeforeAudio;
     private readonly Queue<byte[]> _audioBuffer = new();
     private volatile bool _canStreamAudioToGemini;
 
@@ -46,12 +49,21 @@ public class PushToTalkController : IDisposable
 
     private CancellationTokenSource? _interactionCts;
 
+    // Signals when the screenshot (and pre-buffered audio) have been sent to Gemini for the
+    // current turn. StopRecordingAndProcessAsync awaits this before sending audioStreamEnd so
+    // that Gemini always receives context before the turn is closed — even when the hotkey is
+    // released while ConnectAsync is still in progress.
+    private TaskCompletionSource<bool>? _screenshotReadyTcs;
+
     // Tracks the async disposal of the previous Gemini session so StartRecordingAsync
     // can await it before opening a new connection, preventing socket resource leaks.
     private volatile Task? _geminiDisposalTask;
 
     private static readonly string[] NavigationPhrases =
         ["right here!", "click this!", "this one!", "over here!", "found it!"];
+
+    /// <summary>Raised with a user-facing message when a turn fails (e.g. the provider rejected the key).</summary>
+    public event Action<string>? ErrorMessageRaised;
 
     public PushToTalkController(OverlayManager overlay, AppSettings settings)
     {
@@ -61,11 +73,18 @@ public class PushToTalkController : IDisposable
         _playback = new AudioPlaybackService(settings.Audio.PreBufferMs, settings.Audio.PlaybackBufferSeconds);
         _screenCapture = new ScreenCaptureService();
 
-        _geminiApiKey = CredentialStore.GetKey(CredentialStore.GeminiTarget);
-        _history = ConversationHistory.Load(HistoryPath, settings.Gemini.HistoryTurns);
+        _provider = settings.Provider;
+        _apiKey = CredentialStore.GetKey(CredentialStore.TargetForProvider(_provider));
 
-        if (!string.IsNullOrEmpty(_geminiApiKey))
-            _flashPointing = new GeminiFlashPointingService(_geminiApiKey, settings.Gemini.PointingModel);
+        var isOpenAi = AiProviderFactory.IsOpenAi(_provider);
+        _requireScreenshotBeforeAudio = isOpenAi
+            ? settings.OpenAi.RequireScreenshotBeforeAudio
+            : settings.Gemini.RequireScreenshotBeforeAudio;
+        var historyTurns = isOpenAi ? settings.OpenAi.HistoryTurns : settings.Gemini.HistoryTurns;
+        _history = ConversationHistory.Load(HistoryPath, historyTurns);
+
+        if (!string.IsNullOrEmpty(_apiKey))
+            _flashPointing = AiProviderFactory.CreatePointingService(_provider, _apiKey, settings);
 
         _recorder.LevelsUpdated += levels =>
         {
@@ -79,7 +98,7 @@ public class PushToTalkController : IDisposable
     public void OnHotkeyPressed()
     {
         CancellationTokenSource? oldCts = null;
-        GeminiLiveService? oldGemini = null;
+        IRealtimeVoiceService? oldGemini = null;
         int turnVersion;
         CancellationToken token;
 
@@ -144,9 +163,9 @@ public class PushToTalkController : IDisposable
 
     private async Task StartRecordingAsync(int turnVersion, CancellationToken token)
     {
-        if (string.IsNullOrEmpty(_geminiApiKey))
+        if (string.IsNullOrEmpty(_apiKey))
         {
-            Log.Warning("Gemini API key not configured");
+            Log.Warning("{Provider} API key not configured", _provider);
             TransitionToIdle();
             return;
         }
@@ -168,7 +187,7 @@ public class PushToTalkController : IDisposable
                 if (_state != AppState.Recording || turnVersion != _turnVersion) return;
             }
 
-            var gemini = new GeminiLiveService(_geminiApiKey, _settings.Gemini);
+            var gemini = AiProviderFactory.CreateVoiceService(_provider, _apiKey, _settings);
             AttachGeminiHandlers(gemini);
 
             // Assign under lock so any concurrent interrupt sees the new instance.
@@ -187,14 +206,19 @@ public class PushToTalkController : IDisposable
             _playback.Initialize(new NAudio.Wave.WaveFormat(24000, 16, 1));
             lock (_audioBuffer) { _audioBuffer.Clear(); }
 
+            // Create fresh coordination signal before starting recording so
+            // StopRecordingAndProcessAsync can await it regardless of timing.
+            var screenshotReadyTcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            _screenshotReadyTcs = screenshotReadyTcs;
+
             _recorder.DataAvailable -= OnAudioData; // prevent double-subscription
             _recorder.DataAvailable += OnAudioData;
-            _recorder.StartRecording();
+            _recorder.StartRecording(gemini.InputSampleRateHz);
 
             _pendingScreenshot = null;
             _pendingUserTranscript = null;
             _pendingAssistantText = null;
-            _canStreamAudioToGemini = !_settings.Gemini.RequireScreenshotBeforeAudio;
+            _canStreamAudioToGemini = !_requireScreenshotBeforeAudio;
 
             // Fetch monitors before ConnectAsync so the session's system instruction
             // can include exact screen dimensions for accurate POINT coordinate bounds.
@@ -205,7 +229,14 @@ public class PushToTalkController : IDisposable
 
             lock (_stateLock)
             {
-                if (!_isHotkeyHeld || _state != AppState.Recording || turnVersion != _turnVersion) return;
+                // Proceed even when the hotkey was released during ConnectAsync (state == Processing).
+                // StopRecordingAndProcessAsync holds off on audioStreamEnd until screenshotReadyTcs
+                // completes, so Gemini always receives context before the turn is closed.
+                if (turnVersion != _turnVersion || (_state != AppState.Recording && _state != AppState.Processing))
+                {
+                    screenshotReadyTcs.TrySetResult(false);
+                    return;
+                }
             }
 
             var captures = _screenCapture.CaptureAll(monitors);
@@ -221,24 +252,35 @@ public class PushToTalkController : IDisposable
                 _canStreamAudioToGemini = true;
                 await FlushBufferedAudioAsync(gemini, token);
             }
-            else if (_settings.Gemini.RequireScreenshotBeforeAudio)
+            else if (_requireScreenshotBeforeAudio)
             {
                 // If capture fails, avoid deadlocking turn audio and continue with audio-only.
                 _canStreamAudioToGemini = true;
                 await FlushBufferedAudioAsync(gemini, token);
             }
+            screenshotReadyTcs.TrySetResult(true);
         }
         catch (OperationCanceledException)
         {
             // Normal path when turn is interrupted — no transition needed; the
             // interrupt that cancelled the token already set up the next state.
+            _screenshotReadyTcs?.TrySetResult(false);
         }
         catch (Exception ex)
         {
-            Log.Error(ex, "Failed to start Gemini recording");
+            _screenshotReadyTcs?.TrySetResult(false);
+            Log.Error(ex, "Failed to start {Provider} recording", _provider);
+            // The most common cause is a rejected/misconfigured key. Surface it instead of failing
+            // silently back to idle (which looks like the app is dead).
+            ErrorMessageRaised?.Invoke(BuildConnectionErrorMessage());
             TransitionToIdle();
         }
     }
+
+    private string BuildConnectionErrorMessage() =>
+        AiProviderFactory.IsOpenAi(_provider)
+            ? "Couldn't reach OpenAI. Check your API key and internet connection, and that the key has Realtime API access."
+            : "Couldn't reach Gemini. Check your API key and internet connection. As of June 19, 2026 Gemini rejects unrestricted API keys — in Google AI Studio, restrict your key to the Gemini API, or create a new key.";
 
     private async void OnAudioData(byte[] buffer, int count)
     {
@@ -281,12 +323,14 @@ public class PushToTalkController : IDisposable
 
     private async Task StopRecordingAndProcessAsync()
     {
+        int capturedTurnVersion;
         lock (_stateLock)
         {
             if (_state != AppState.Recording)
                 return;
 
             _state = AppState.Processing;
+            capturedTurnVersion = _turnVersion;
             System.Windows.Application.Current?.Dispatcher.BeginInvoke(() =>
                 _overlay.SetState(AppState.Processing));
         }
@@ -309,6 +353,21 @@ public class PushToTalkController : IDisposable
             try { token = cts?.Token ?? CancellationToken.None; }
             catch (ObjectDisposedException) { token = CancellationToken.None; }
 
+            // If ConnectAsync was still in progress when the hotkey was released, StartRecordingAsync
+            // may still be sending the screenshot + buffered audio. Wait for it so that Gemini
+            // receives context before we signal end-of-turn with audioStreamEnd.
+            var screenshotTcs = _screenshotReadyTcs;
+            if (screenshotTcs != null && !screenshotTcs.Task.IsCompleted)
+            {
+                try { await screenshotTcs.Task.WaitAsync(TimeSpan.FromSeconds(5), token); }
+                catch { /* proceed regardless — audioStreamEnd must be sent */ }
+            }
+
+            // Recover automatically if Gemini doesn't respond within the timeout.
+            // This guards against the rare case where Gemini receives an empty turn
+            // (e.g., near-zero audio) and never fires turnComplete.
+            _ = EnforceProcessingTimeoutAsync(capturedTurnVersion, token);
+
             await gemini.CompleteTurnAsync(token);
         }
         catch (OperationCanceledException) { }
@@ -317,6 +376,26 @@ public class PushToTalkController : IDisposable
             Log.Warning(ex, "Failed to complete turn");
             TransitionToIdle();
         }
+    }
+
+    private async Task EnforceProcessingTimeoutAsync(int capturedTurnVersion, CancellationToken token)
+    {
+        try
+        {
+            await Task.Delay(TimeSpan.FromSeconds(15), token);
+        }
+        catch (OperationCanceledException)
+        {
+            return; // Normal: the state exited Processing before the timeout fired.
+        }
+
+        lock (_stateLock)
+        {
+            if (_state != AppState.Processing || _turnVersion != capturedTurnVersion) return;
+        }
+
+        Log.Warning("No response from Gemini within 15s in Processing state — recovering to Idle");
+        TransitionToIdle();
     }
 
     private async void OnGeminiAudioReceived(byte[] pcmData)
@@ -488,14 +567,15 @@ public class PushToTalkController : IDisposable
             }
         }
 
-        Log.Error(ex, "Gemini service reported an error");
+        Log.Error(ex, "{Provider} service reported an error", _provider);
+        ErrorMessageRaised?.Invoke(BuildConnectionErrorMessage());
         TransitionToIdle();
     }
 
     private void TransitionToIdle()
     {
         CancellationTokenSource? oldCts;
-        GeminiLiveService? oldGemini;
+        IRealtimeVoiceService? oldGemini;
 
         lock (_stateLock)
         {
@@ -527,7 +607,7 @@ public class PushToTalkController : IDisposable
         });
     }
 
-    private void AttachGeminiHandlers(GeminiLiveService gemini)
+    private void AttachGeminiHandlers(IRealtimeVoiceService gemini)
     {
         gemini.AudioReceived += OnGeminiAudioReceived;
         gemini.TextCompleted += OnGeminiTextCompleted;
@@ -537,7 +617,7 @@ public class PushToTalkController : IDisposable
         gemini.ErrorOccurred += OnGeminiError;
     }
 
-    private void DetachGeminiHandlers(GeminiLiveService gemini)
+    private void DetachGeminiHandlers(IRealtimeVoiceService gemini)
     {
         gemini.AudioReceived -= OnGeminiAudioReceived;
         gemini.TextCompleted -= OnGeminiTextCompleted;
@@ -547,14 +627,14 @@ public class PushToTalkController : IDisposable
         gemini.ErrorOccurred -= OnGeminiError;
     }
 
-    private void DisposeGeminiInstance(GeminiLiveService gemini)
+    private void DisposeGeminiInstance(IRealtimeVoiceService gemini)
     {
         try { DetachGeminiHandlers(gemini); }
         catch (Exception ex) { Log.Warning(ex, "Failed to detach Gemini event handlers cleanly"); }
         _geminiDisposalTask = gemini.DisposeAsync().AsTask();
     }
 
-    private async Task FlushBufferedAudioAsync(GeminiLiveService gemini, CancellationToken token)
+    private async Task FlushBufferedAudioAsync(IRealtimeVoiceService gemini, CancellationToken token)
     {
         while (true)
         {
@@ -592,7 +672,7 @@ public class PushToTalkController : IDisposable
     public void Dispose()
     {
         CancellationTokenSource? oldCts;
-        GeminiLiveService? oldGemini;
+        IRealtimeVoiceService? oldGemini;
 
         lock (_stateLock)
         {

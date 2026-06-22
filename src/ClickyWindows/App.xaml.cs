@@ -29,10 +29,10 @@ public partial class App : System.Windows.Application
 
         SetupGlobalExceptionHandlers();
 
-        if (!CredentialStore.HasAllKeys())
+        if (!CredentialStore.HasKeyForProvider(_settings.Provider))
         {
-            Log.Warning("Missing API keys: {MissingKeys}", string.Join(", ", CredentialStore.GetMissingKeyNames()));
-            var wizard = new SetupWizardWindow();
+            Log.Warning("Missing API key for provider {Provider}", _settings.Provider);
+            var wizard = new SetupWizardWindow(provider: _settings.Provider);
             if (wizard.ShowDialog() != true)
             {
                 Shutdown(0);
@@ -53,6 +53,9 @@ public partial class App : System.Windows.Application
         _tray = new TrayIconManager(_settings, _pushToTalk);
         _tray.QuitRequested += OnQuitRequested;
         _tray.Initialize();
+
+        // Surface turn failures (e.g. a rejected API key) as a tray balloon instead of failing silently.
+        _pushToTalk.ErrorMessageRaised += message => _tray.ShowError(message);
 
         Log.Information("ClickyWindows started successfully");
     }

@@ -27,7 +27,9 @@ Powered entirely by the **Gemini Live API** — one WebSocket handles speech rec
 ## Prerequisites
 
 - Windows 10/11 (x64)
-- A **Gemini API key** — get one free at [aistudio.google.com](https://aistudio.google.com/apikey)
+- An API key for your chosen voice provider:
+  - **Gemini** (default) — get one at [aistudio.google.com](https://aistudio.google.com/apikey). Note: since **June 19, 2026** Google rejects *unrestricted* keys — restrict your key to the Gemini API in AI Studio, or create a new key.
+  - **OpenAI** — get one at [platform.openai.com](https://platform.openai.com/api-keys); the key needs Realtime API access.
 - No Node.js, no proxy server, no environment variables
 
 ---
@@ -64,7 +66,7 @@ dotnet publish src/ClickyWindows/ClickyWindows.csproj \
 
 ## First-run setup
 
-On first launch a setup wizard appears. Paste your Gemini API key and click **Save and Start**.
+On first launch a setup wizard appears. Paste the API key for your selected provider (Gemini by default — see `Provider` in `appsettings.json`) and click **Save and Start**. You can fill in both the Gemini and OpenAI keys if you plan to switch providers.
 
 Your key is stored in **Windows Credential Manager** — never written to any file on disk. To update it later, right-click the tray icon → **Manage API Keys...**
 
@@ -88,6 +90,7 @@ The triangle animates to whatever screen element Gemini references in its reply.
 
 ```json
 {
+  "Provider": "Gemini",
   "Hotkey": {
     "Key": "Menu",
     "Modifiers": "Control"
@@ -101,11 +104,26 @@ The triangle animates to whatever screen element Gemini references in its reply.
     "Model": "models/gemini-3.1-flash-live-preview",
     "VoiceName": "Aoede",
     "ConnectTimeoutMs": 5000
+  },
+  "OpenAi": {
+    "Model": "gpt-realtime",
+    "VoiceName": "marin",
+    "PointingModel": "gpt-4o",
+    "ConnectTimeoutMs": 5000
   }
 }
 ```
 
-`Key: "Menu"` is the right Alt key. `Modifiers: "Control"` means the left Ctrl must be held simultaneously. Available voice names (as of Gemini 2.5): `Aoede`, `Charon`, `Fenrir`, `Kore`, `Puck`.
+`Key: "Menu"` is the right Alt key. `Modifiers: "Control"` means the left Ctrl must be held simultaneously. Gemini voice names (as of Gemini 2.5): `Aoede`, `Charon`, `Fenrir`, `Kore`, `Puck`.
+
+### Choosing a provider
+
+Set `"Provider"` to `"Gemini"` (default) or `"OpenAI"`. Both run the same experience — voice answer plus the triangle flying to the referenced UI element — using only that provider's API key:
+
+- **Gemini** uses the Gemini Live API for voice and a Gemini vision model for pointing.
+- **OpenAI** uses the OpenAI Realtime API for voice (24 kHz audio) and a vision chat model (`gpt-4o` by default) for pointing.
+
+These are the two providers that support a realtime voice **and** vision (screenshot) session in one pass. After switching `Provider`, make sure that provider's key is set (tray → **Manage API Keys...**).
 
 ---
 

@@ -61,9 +61,25 @@ public class TrayIconManager : IDisposable
         Log.Information("Tray icon initialized");
     }
 
+    /// <summary>Shows a tray balloon so turn failures (e.g. a rejected API key) are visible
+    /// instead of the app silently going idle. Marshalled to the UI thread that owns the icon.</summary>
+    public void ShowError(string message)
+    {
+        var icon = _notifyIcon;
+        if (icon == null) return;
+
+        System.Windows.Application.Current?.Dispatcher.BeginInvoke(() =>
+        {
+            icon.BalloonTipTitle = "Clicky";
+            icon.BalloonTipText = message;
+            icon.BalloonTipIcon = ToolTipIcon.Warning;
+            icon.ShowBalloonTip(8000);
+        });
+    }
+
     private void OnManageKeys(object? sender, EventArgs e)
     {
-        var wizard = new SetupWizardWindow(prePopulate: true);
+        var wizard = new SetupWizardWindow(prePopulate: true, provider: _settings.Provider);
         wizard.Show();
     }
 

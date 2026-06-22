@@ -4,7 +4,8 @@ using Serilog;
 namespace ClickyWindows.Audio;
 
 /// <summary>
-/// Records microphone input using NAudio WaveInEvent at 16kHz mono PCM16.
+/// Records microphone input using NAudio WaveInEvent as mono PCM16. The sample rate is chosen
+/// per voice provider (Gemini Live = 16kHz, OpenAI Realtime = 24kHz) and passed to StartRecording.
 /// </summary>
 public class MicrophoneRecorder : IDisposable
 {
@@ -17,13 +18,13 @@ public class MicrophoneRecorder : IDisposable
 
     public AudioLevelMonitor LevelMonitor => _levelMonitor;
 
-    public void StartRecording()
+    public void StartRecording(int sampleRateHz = 16000)
     {
         if (_recording) return;
 
         _waveIn = new WaveInEvent
         {
-            WaveFormat = new WaveFormat(16000, 16, 1), // 16kHz, PCM16, mono
+            WaveFormat = new WaveFormat(sampleRateHz, 16, 1), // PCM16, mono
             BufferMilliseconds = 100
         };
 

@@ -2,9 +2,12 @@ namespace ClickyWindows;
 
 public class AppSettings
 {
+    // Selects which realtime voice provider answers each turn: "Gemini" or "OpenAI".
+    public string Provider { get; set; } = "Gemini";
     public HotkeySettings Hotkey { get; set; } = new();
     public AudioSettings Audio { get; set; } = new();
     public GeminiSettings Gemini { get; set; } = new();
+    public OpenAiSettings OpenAi { get; set; } = new();
 }
 
 public class HotkeySettings
@@ -26,6 +29,20 @@ public class GeminiSettings
     public string VoiceName { get; set; } = "Aoede";
     public int ConnectTimeoutMs { get; set; } = 5000;
     public string PointingModel { get; set; } = "models/gemini-pro-latest";
+    public int HistoryTurns { get; set; } = 6;
+    public bool RequireScreenshotBeforeAudio { get; set; } = true;
+    public double Temperature { get; set; } = 0.1;
+    public string MediaResolution { get; set; } = "MEDIA_RESOLUTION_HIGH";
+}
+
+public class OpenAiSettings
+{
+    // Realtime (voice) model — the GA family is "gpt-realtime"; pin a dated snapshot here if needed.
+    public string Model { get; set; } = "gpt-realtime";
+    public string VoiceName { get; set; } = "marin";
+    public int ConnectTimeoutMs { get; set; } = 5000;
+    // Vision model used by OpenAiPointingService (chat completions) to locate UI elements.
+    public string PointingModel { get; set; } = "gpt-4o";
     public int HistoryTurns { get; set; } = 6;
     public bool RequireScreenshotBeforeAudio { get; set; } = true;
     public double Temperature { get; set; } = 0.1;
